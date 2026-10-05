@@ -12,7 +12,7 @@ import { NodeSelection, TextSelection } from '@tiptap/pm/state'
 import { parseDocx, saveDocx } from '@genoffice/docx-engine'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildDocx } from '../../../packages/docx-engine/tests/helpers/build-docx'
 import {
   blocksToPmDoc,
@@ -21,7 +21,11 @@ import {
   type PmNode,
 } from '../src/renderer/editor/convert'
 import { editorExtensions, rowHeightCss, tableRowEatCss } from '../src/renderer/editor/extensions'
+
+/** Word default cell margins are 0 top/bottom; declared row heights carry them (2026-09-23 probe) */
+const PAD = 'var(--doc-cell-pad-t,0px) + var(--doc-cell-pad-b,0px)'
 import { renderTableSpec } from '../src/renderer/editor/protected-render'
+import { collectRevisions, type TrackChangesStorage } from '../src/renderer/editor/revisions'
 import {
   constrainSelectedTableWidth,
   constrainTableWidthAtCell,
@@ -63,7 +67,114 @@ async function openTable(): Promise<{
   return { editor, parsed, source }
 }
 
+function selectLastCellTextEnd(editor: Editor): void {
+  let lastCellTextEnd = 0
+  editor.state.doc.descendants((node, pos) => {
+    if (node.isText && node.text === 'D') lastCellTextEnd = pos + node.nodeSize
+  })
+  editor.view.dispatch(
+    editor.state.tr.setSelection(TextSelection.create(editor.state.doc, lastCellTextEnd)),
+  )
+}
+
+function pressKey(editor: Editor, key: string): void {
+  const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  editor.view.someProp('handleKeyDown', (handler) => handler(editor.view, event))
+}
+
+function clickBelowTrailingTable(editor: Editor): void {
+  const event = new MouseEvent('mousedown', { button: 0, bubbles: true, cancelable: true })
+  Object.defineProperty(event, 'target', { value: editor.view.dom })
+  vi.spyOn(editor.view, 'posAtCoords').mockReturnValue({
+    pos: editor.state.doc.content.size,
+    inside: -1,
+  })
+  editor.view.someProp('handleClick', (handler) =>
+    handler(editor.view, editor.state.doc.content.size, event),
+  )
+}
+
 describe('native editable tables', () => {
+  it('allows typing after an imported trailing table', async () => {
+    const { editor } = await openTable()
+    selectLastCellTextEnd(editor)
+    vi.spyOn(editor.view, 'endOfTextblock').mockImplementation((dir) => dir === 'down')
+    vi.spyOn(editor.view, 'coordsAtPos').mockReturnValue({ left: 0, right: 0, top: 0, bottom: 0 })
+
+    pressKey(editor, 'ArrowDown')
+
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+    expect(editor.state.doc.lastChild?.content.size).toBe(0)
+    expect(editor.state.selection).toBeInstanceOf(TextSelection)
+    expect(editor.state.selection.$from.parent.type.name).toBe('docParagraph')
+
+    editor.commands.insertContent('below')
+
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+    expect(editor.state.doc.lastChild?.textContent).toBe('below')
+    editor.destroy()
+  })
+
+  it('clicking below an imported trailing table places a text cursor in a new paragraph', async () => {
+    const { editor } = await openTable()
+
+    clickBelowTrailingTable(editor)
+
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+    expect(editor.state.doc.lastChild?.content.size).toBe(0)
+    expect(editor.state.selection).toBeInstanceOf(TextSelection)
+    expect(editor.state.selection.$from.parent.type.name).toBe('docParagraph')
+
+    editor.commands.insertContent('below-click')
+
+    expect(editor.state.doc.lastChild?.textContent).toBe('below-click')
+    editor.destroy()
+  })
+
+  it('does not add a second paragraph when clicking below a trailing table with one already', async () => {
+    const { editor } = await openTable()
+    const pos = editor.state.doc.content.size
+    const paragraph = editor.schema.nodes.docParagraph.create()
+    const transaction = editor.state.tr.insert(pos, paragraph)
+    editor.view.dispatch(transaction.setSelection(TextSelection.create(transaction.doc, pos + 1)))
+    const childCount = editor.state.doc.childCount
+
+    clickBelowTrailingTable(editor)
+
+    expect(editor.state.doc.childCount).toBe(childCount)
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+    editor.destroy()
+  })
+
+  it('exiting a trailing table under track changes records no revision', async () => {
+    const { editor } = await openTable()
+    const storage = editor.storage.trackChanges as TrackChangesStorage
+    storage.enabled = true
+    storage.author = 'Tester'
+
+    clickBelowTrailingTable(editor)
+
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+    expect(collectRevisions(editor.state.doc)).toHaveLength(0)
+    editor.destroy()
+  })
+
+  it('undoing a trailing-table exit does not recreate its paragraph', async () => {
+    const { editor } = await openTable()
+    selectLastCellTextEnd(editor)
+    vi.spyOn(editor.view, 'endOfTextblock').mockImplementation((dir) => dir === 'down')
+    vi.spyOn(editor.view, 'coordsAtPos').mockReturnValue({ left: 0, right: 0, top: 0, bottom: 0 })
+
+    pressKey(editor, 'ArrowDown')
+    expect(editor.state.doc.lastChild?.type.name).toBe('docParagraph')
+
+    expect(editor.commands.undo()).toBe(true)
+
+    expect(editor.state.doc.lastChild?.type.name).toBe('docTable')
+    expect(editor.state.doc.childCount).toBe(1)
+    editor.destroy()
+  })
+
   it('redistributes requested column widths within the section content box', () => {
     expect(fitColumnWidths([200, 200, 200], new Map([[0, 500]]), 600)).toEqual([500, 50, 50])
     const many = fitColumnWidths(new Array(20).fill(100), new Map([[0, 1000]]), 600)
@@ -78,7 +189,7 @@ describe('native editable tables', () => {
     expect(json.content?.[0].type).toBe('docTable')
     expect(json.content?.[0].content?.[0].content?.[0]).toMatchObject({
       type: 'docTableCell',
-      attrs: { fill: 'D9EAF7', bold: true, color: '1F4E78', colspan: 1, rowspan: 1 },
+      attrs: { fill: 'D9EAF7', bold: false, color: null, colspan: 1, rowspan: 1 },
     })
     expect(json.content?.[0].content?.[0].content?.[0].content?.[0].content?.[0].marks).toEqual([
       { type: 'bold' },
@@ -90,18 +201,30 @@ describe('native editable tables', () => {
           sizeHalfPoints: null,
           font: 'Calibri',
           fontAscii: 'Calibri',
+          eastAsiaFont: 'Calibri',
           csFont: null,
           charSpacingTwips: null,
           charScaleEm: null,
+          charScalePct: null,
+          charScaleX: null,
           highlight: null,
           shading: null,
+          shadingDisplay: null,
+          textOutline: null,
+          textEffect: null,
+          dstrike: null,
+          glow: null,
+          positionHalfPoints: null,
+          bdr: null,
           vertAlign: null,
           em: null,
           boldOff: null,
           italicOff: null,
           kern: null,
+          kernHalfPoints: null,
           caps: null,
           vanish: null,
+          vanishOwn: null,
           eaLang: null,
           cs: null,
           rtl: null,
@@ -366,6 +489,22 @@ describe('native editable tables', () => {
       'width:min(1200px,calc(var(--doc-content-w,100%) + var(--doc-margin-right,0px) - 96.7px))',
     )
     expect(spec[1].style).toContain('margin-left:96.7px')
+    // a negative indent hangs into the left margin and widens the spill by as much
+    editor.view.dispatch(
+      editor.state.tr.setNodeMarkup(0, undefined, {
+        ...table.attrs,
+        widthPx: 1200,
+        indentTwips: -714,
+      }),
+    )
+    const hanging = editor.schema.nodes.docTable.spec.toDOM!(editor.state.doc.firstChild!) as [
+      string,
+      Record<string, string>,
+    ]
+    expect(hanging[1].style).toContain(
+      'width:min(1200px,calc(var(--doc-content-w,100%) + var(--doc-margin-right,0px) + 47.6px))',
+    )
+    expect(hanging[1].style).toContain('margin-left:-47.6px')
     editor.destroy()
   })
 
@@ -594,7 +733,7 @@ describe('native editable tables', () => {
     // sz=4 eighths = 0.5pt gridline = 0.67px at 96dpi
     expect(table.style.getPropertyValue('--doc-row-eat')).toBe('0.67px')
     const tr = table.querySelector('tr') as HTMLElement
-    expect(tr.getAttribute('style')).toContain('calc(54.3px + var(--doc-row-eat,0px))')
+    expect(tr.getAttribute('style')).toContain(`calc(54.3px + ${PAD} + var(--doc-row-eat,0px))`)
     editor.destroy()
 
     const borderless =
@@ -637,10 +776,10 @@ describe('native editable tables', () => {
     expect(table.style.getPropertyValue('--doc-row-eat')).toBe('')
     const rows = Array.from(table.querySelectorAll('tr')).map((tr) => tr.getAttribute('style'))
     // explicit nil borders: no gridline, no advance; sz=4 = 0.5pt = 0.67px per lined row
-    expect(rows[0]).toMatch(/^height:\s*15(\.0)?px;?$/)
-    expect(rows[1]).toContain('calc(15.0px + 0.67px * var(--doc-row-grid,1))')
-    expect(rows[2]).toContain('calc(30.0px + 0.67px * var(--doc-row-grid,1))')
-    expect(rows[3]).toContain('calc(15.0px + var(--doc-row-eat,0px))')
+    expect(rows[0]).toContain(`calc(15.0px + ${PAD})`)
+    expect(rows[1]).toContain(`calc(15.0px + ${PAD} + 0.67px * var(--doc-row-grid,1))`)
+    expect(rows[2]).toContain(`calc(30.0px + ${PAD} + 0.67px * var(--doc-row-grid,1))`)
+    expect(rows[3]).toContain(`calc(15.0px + ${PAD} + var(--doc-row-eat,0px))`)
     editor.destroy()
 
     const spec = renderTableSpec({
@@ -661,8 +800,8 @@ describe('native editable tables', () => {
     const dom = document.createElement('div')
     dom.appendChild(DOMSerializer.renderSpec(document, spec as never).dom)
     const trs = Array.from(dom.querySelectorAll('tr')).map((tr) => tr.getAttribute('style'))
-    expect(trs[0]).toContain('calc(15.0px + 0.67px * var(--doc-row-grid,1))')
-    expect(trs[1]).toMatch(/^height:\s*15(\.0)?px;?$/)
+    expect(trs[0]).toContain(`calc(15.0px + ${PAD} + 0.67px * var(--doc-row-grid,1))`)
+    expect(trs[1]).toContain(`calc(15.0px + ${PAD})`)
   })
 
   it('row gridline: mixed cells take the larger of cell line and table gridline, spaced tables none, gap cells ignored', () => {
@@ -670,19 +809,36 @@ describe('native editable tables', () => {
     const thick = { style: 'single', szEighths: 12 }
     // one cell explicit thin, one inheriting the table insideH: whichever is wider wins at render time
     expect(rowHeightCss(225, [{ top: thin, bottom: thin }, null])).toBe(
-      'height:calc(15.0px + max(0.67px, var(--doc-row-eat,0px)) * var(--doc-row-grid,1))',
+      `height:calc(15.0px + ${PAD} + max(0.67px, var(--doc-row-eat,0px)) * var(--doc-row-grid,1))`,
     )
     expect(rowHeightCss(225, [{ top: thick, bottom: thick }])).toBe(
-      'height:calc(15.0px + 2.00px * var(--doc-row-grid,1))',
+      `height:calc(15.0px + ${PAD} + 2.00px * var(--doc-row-grid,1))`,
     )
     expect(tableRowEatCss({ insideH: thin } as never, true)).toEqual(['--doc-row-grid:0'])
     expect(tableRowEatCss({ insideH: thin } as never, false)).toEqual(['--doc-row-eat:0.67px'])
     // an all-nil row keeps its bare height even though a gap placeholder (borders null) sits in it
     const nil = { style: 'nil' }
-    expect(rowHeightCss(225, [{ top: nil, bottom: nil }])).toBe('height:15.0px')
+    expect(rowHeightCss(225, [{ top: nil, bottom: nil }])).toBe(`height:calc(15.0px + ${PAD})`)
     // nested tables must not inherit a spaced parent's grid switch or its gridline
     const css = readFileSync(resolve(__dirname, '../src/renderer/styles.css'), 'utf8')
     expect(css).toMatch(/\.doc-table \{[^}]*--doc-row-eat: 0px;[^}]*--doc-row-grid: 1;/s)
+  })
+
+  it('adds the cell margins on top of an atLeast trHeight, but not for hRule=exact (Word probe 2026-09-23)', () => {
+    // trHeight 440 twips = 22pt floors the content; tcMar 100 twips (5pt) per side
+    // makes the row 33.12pt in Word, exact rows keep the bare 22pt
+    const mar = { top: 100, bottom: 100 }
+    const noLine = { top: { style: 'nil' }, bottom: { style: 'nil' } }
+    expect(rowHeightCss(440, [noLine], [mar])).toBe('height:calc(29.3px + 13.33px)')
+    expect(rowHeightCss(440, [noLine], [mar], 'exact')).toBe('height:29.3px')
+    // a cell with no w:tcMar falls back to the table default
+    expect(rowHeightCss(440, [noLine, noLine], [mar, null])).toBe(
+      `height:calc(29.3px + max(13.33px, ${PAD}))`,
+    )
+    // one declared side only: the other falls back
+    expect(rowHeightCss(440, [noLine], [{ top: 100 }])).toBe(
+      'height:calc(29.3px + 6.67px + var(--doc-cell-pad-b,0px))',
+    )
   })
 
   it('insets cell text by max(margin, border/2) and spans the outer half-borders (Word probe 2026-09-03)', async () => {
@@ -705,16 +861,17 @@ describe('native editable tables', () => {
       content: blocksToPmDoc(parsed.blocks) as never,
     })
     const table = editor.view.dom.querySelector('table.doc-table') as HTMLElement
-    // 2 x 113px grid + half of the 1px outer borders on each side
-    expect(table.getAttribute('style')).toContain('width: min(227px,')
+    // 3400-twip grid = 227px (rounded from the total) + half of the collapsed outer lines:
+    // the first cell's 2pt (3px) tcBorder wins the left edge, the table's 1px the right
+    expect(table.getAttribute('style')).toContain('width: min(229px,')
     expect(table.style.getPropertyValue('--doc-bw-v')).toBe('1px')
     expect(table.style.getPropertyValue('--doc-bw-l')).toBe('1px')
     expect(table.style.getPropertyValue('--doc-cell-pad-l')).toBe('7.2px')
-    expect(table.style.getPropertyValue('--doc-cell-pad-t')).toBe('0.0px')
+    expect(table.style.getPropertyValue('--doc-cell-pad-t')).toBe('0px')
     const [a, b] = [...table.querySelectorAll('td')] as HTMLElement[]
     // the cell's own 2pt left border and tcMar feed the inset rule as variables, not as padding
     expect(a.style.getPropertyValue('--cell-bw-l')).toBe('3px')
-    expect(a.style.getPropertyValue('--doc-cell-pad-l')).toBe('13.3px')
+    expect(a.style.getPropertyValue('--doc-cell-pad-l')).toBe('13.333px')
     expect(a.style.paddingLeft).toBe('')
     expect(b.style.getPropertyValue('--cell-bw-l')).toBe('')
     editor.destroy()
@@ -766,7 +923,7 @@ describe('native editable tables', () => {
       content: blocksToPmDoc(parsed.blocks) as never,
     })
     const table = editor.view.dom.querySelector('table.doc-table') as HTMLElement
-    expect(table.getAttribute('style')).toContain('width: min(226px,')
+    expect(table.getAttribute('style')).toContain('width: min(227px,')
     expect(table.style.getPropertyValue('--doc-bw-share')).toBe('0')
     expect(table.style.getPropertyValue('--doc-bd-share')).toBe('1')
     editor.destroy()

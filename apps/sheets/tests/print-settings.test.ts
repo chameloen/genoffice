@@ -52,6 +52,24 @@ describe('decodeHeaderFooter', () => {
   it('accepts lowercase section markers', () => {
     expect(decodeHeaderFooter('&lLeft&rRight')).toEqual({ left: 'Left', right: 'Right' })
   })
+
+  it('keeps the character after an unrecognised code as literal text', () => {
+    // The decoder used to advance past any &X it did not know, so the
+    // character (or the space after the &) disappeared from the printout.
+    expect(decodeHeaderFooter('Tom&Jerry')).toEqual({ center: 'Tom&Jerry' })
+    expect(decodeHeaderFooter('R&D')).toEqual({ center: 'R&D' })
+    expect(decodeHeaderFooter('Tom & Jerry')).toEqual({ center: 'Tom & Jerry' })
+    expect(decodeHeaderFooter('&L50% & up')).toEqual({ left: '50% & up' })
+    // The recognised sequences keep behaving exactly as before: && and the
+    // field codes stay verbatim, and the formatting toggles stay stripped
+    // (&B is Excel's bold toggle, so "A&B" still prints a bold "A").
+    expect(decodeHeaderFooter('&LProfit && Loss')).toEqual({ left: 'Profit && Loss' })
+    expect(decodeHeaderFooter('&C&P of &N in &F')).toEqual({ center: '&P of &N in &F' })
+    expect(decodeHeaderFooter('&C&"Broadway,Bold"&12&KFF0000Big &BRed&B Title&Z')).toEqual({
+      center: 'Big Red Title',
+    })
+    expect(decodeHeaderFooter('A&B')).toEqual({ center: 'A' })
+  })
 })
 
 describe('printAreasFromFormula', () => {
@@ -70,11 +88,24 @@ describe('printAreasFromFormula', () => {
   it('falls back to the used range for refs it cannot crop to', () => {
     expect(printAreasFromFormula("'S'!$A:$C")).toEqual([])
     expect(printAreasFromFormula("'S'!#REF!")).toEqual([])
+  })
+
+  it('skips #REF! parts but keeps the used-range fallback for uncroppable ones', () => {
     expect(printAreasFromFormula("'S'!$A$1:$B$2,'S'!$C:$D")).toEqual([])
+    expect(printAreasFromFormula("'S'!#REF!,'S'!$D$3")).toEqual(['D3:D3'])
   })
 
   it('returns [] when absent', () => {
     expect(printAreasFromFormula(undefined)).toEqual([])
+  })
+
+  it('normalises an area whose corners are reversed', () => {
+    // parseRange treats $B$4:$A$1 as A1:B4; the print layout reads an area
+    // positionally, so passing the pair through verbatim made the export
+    // abort with "this sheet has nothing printable" instead of printing.
+    expect(printAreasFromFormula("'S'!$B$4:$A$1")).toEqual(['A1:B4'])
+    expect(printAreasFromFormula("'S'!$D$3:$B$9")).toEqual(['B3:D9'])
+    expect(printAreasFromFormula("'S'!$B$2:$B$2")).toEqual(['B2:B2'])
   })
 })
 
@@ -284,6 +315,19 @@ describe('resolveEffectivePageSetup', () => {
     expect(setup.printAreas).toEqual(['B2:C3'])
   })
 
+  it('prints a reversed print area instead of refusing the export', () => {
+    // The whole chain: an inverted $B$4:$A$1 in the file's Print_Area used to
+    // reach parseArea positionally, the rows < 1 guard fired, and Export PDF
+    // refused outright. It must lay out A1:B4 like parseRange resolves it.
+    const setup = resolveEffectivePageSetup({}, null, { printArea: "'S'!$B$4:$A$1" })
+    expect(setup.printAreas).toEqual(['A1:B4'])
+    const payload = buildSheetPrintPayload(fakeWorksheet(), setup, 'Book.pdf', 'S1')
+    expect(payload.html).toContain('<table>')
+    // The normalised corners select the whole A1:B4 span, not a 0-row range.
+    expect(payload.html).toContain('A1')
+    expect(payload.html).toContain('B3')
+  })
+
   it('drops title rows stretched past the cap by inserts between them', () => {
     const setup = resolveEffectivePageSetup({}, null, { printTitles: "'S'!$1:$2" }, [
       { kind: 'insert-rows', index: 1, count: 25 },
@@ -408,6 +452,37 @@ function tallWorksheet(rows: number): PrintWorksheet {
 }
 
 describe('buildSheetPrintPayload', () => {
+  it('maps common OOXML paper sizes instead of falling back to A4', () => {
+    const b4 = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({ paperSize: 12 }),
+      'Book.pdf',
+      'S1',
+    )
+    expect(b4.pageSize).toEqual({ width: 9.84, height: 13.9 })
+    const b5 = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({ paperSize: 13 }),
+      'Book.pdf',
+      'S1',
+    )
+    expect(b5.pageSize).toEqual({ width: 7.17, height: 10.12 })
+    const folio = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({ paperSize: 14 }),
+      'Book.pdf',
+      'S1',
+    )
+    expect(folio.pageSize).toEqual({ width: 8.5, height: 13 })
+    const statement = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({ paperSize: 6 }),
+      'Book.pdf',
+      'S1',
+    )
+    expect(statement.pageSize).toEqual({ width: 5.5, height: 8.5 })
+  })
+
   it('crops the layout to the print area', () => {
     const payload = buildSheetPrintPayload(
       fakeWorksheet(),
@@ -429,7 +504,52 @@ describe('buildSheetPrintPayload', () => {
       'S1',
     )
     expect(payload.html.match(/<table>/g)).toHaveLength(2)
-    expect(payload.html).toContain('table + table { break-before: page; }')
+    expect(payload.html).toContain('.area + .area { break-before: page; }')
+  })
+
+  it('places floating visuals at their anchor and widens the used range to cover them', () => {
+    const visual = {
+      id: 'v1',
+      fromRow: 1,
+      fromColumn: 1,
+      toRow: 6,
+      toColumn: 4,
+      offsetXPx: 10,
+      offsetYPx: 4,
+      widthPx: 400,
+      heightPx: 200,
+      html: '<div class="xlsx-print-visual">chart</div>',
+    }
+    const outside = { ...visual, id: 'v2', fromRow: 40, fromColumn: 30, toRow: 41, toColumn: 31 }
+    const payload = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({ printAreas: ['A1:B3'] }),
+      'Book.pdf',
+      'S1',
+      new Map(),
+      { visuals: [visual, outside], css: '.xlsx-chart { color: black; }' },
+    )
+    // column B starts after one 100px (75pt) column; row 2 after one printed 11pt text row (15.75pt)
+    expect(payload.html).toContain(
+      '<div class="pv" style="left:82.5pt;top:18.75pt;width:300pt;height:150pt"><div style="width:400px;height:200px"><div class="xlsx-print-visual">chart</div></div></div>',
+    )
+    expect(payload.html.match(/class="pv"/g)).toHaveLength(1)
+    expect(payload.html).toContain('<style>.xlsx-chart { color: black; }</style>')
+
+    const widened = buildSheetPrintPayload(
+      fakeWorksheet(),
+      payloadSetup({}),
+      'Book.pdf',
+      'S1',
+      new Map(),
+      {
+        visuals: [visual],
+        css: '',
+      },
+    )
+    // A:B of data, but the chart reaches column E (index 4)
+    expect(widened.html.match(/<col /g)).toHaveLength(5)
+    expect(widened.html).not.toContain('<style></style>')
   })
 
   it('carries the page geometry and header/footer templates', () => {
@@ -593,5 +713,17 @@ describe('buildSheetPrintPayload', () => {
     )
     expect(fixed.headerTemplate).toContain('width:590px;height:58px')
     expect(fixed.footerTemplate).toContain('font-size:9pt')
+  })
+
+  it('sanitizes non-finite workbook dimensions instead of emitting NaNpt', () => {
+    const hostile: PrintWorksheet = {
+      ...fakeWorksheet(),
+      getRowHeight: () => NaN,
+      getColumnWidth: () => Infinity,
+    }
+    const payload = buildSheetPrintPayload(hostile, payloadSetup({}), 'Book.pdf', 'S1')
+    expect(payload.html).toContain('<table>')
+    expect(payload.html).not.toContain('NaN')
+    expect(payload.html).not.toContain('Infinity')
   })
 })

@@ -29,9 +29,16 @@ import type {
   TextInsertFailure,
 } from '../shared/ipc'
 import { writePdfAtomically } from './atomic-write'
+import { redactPdf } from './redaction'
 
 const num = (v: number) => Math.round(v * 100) / 100
 const STATIC_FORM_FILLS_KEY = PDFName.of('GenOfficeStaticFormFills')
+
+const rectsIntersect = (a: readonly number[], b: readonly number[]): boolean =>
+  Math.min(a[0]!, a[2]!) < Math.max(b[0]!, b[2]!) &&
+  Math.max(a[0]!, a[2]!) > Math.min(b[0]!, b[2]!) &&
+  Math.min(a[1]!, a[3]!) < Math.max(b[1]!, b[3]!) &&
+  Math.max(a[1]!, a[3]!) > Math.min(b[1]!, b[3]!)
 
 function validStaticFormFill(value: unknown): value is StaticFormFillRecord {
   if (!value || typeof value !== 'object') return false
@@ -71,6 +78,15 @@ function resultingStaticFormFills(
     )
   const newPageIndex = new Map(remaining.map((oldPageIndex, index) => [oldPageIndex, index]))
   return request.staticFormFills.flatMap((record) => {
+    // This private JSON cache can contain form text even after its painted image is
+    // removed. Drop cache records that native area redaction covers.
+    if (
+      request.redactions?.some(
+        (redaction) =>
+          redaction.pageIndex === record.pageIndex && rectsIntersect(redaction.rect, record.rect),
+      )
+    )
+      return []
     const pageIndex = newPageIndex.get(record.pageIndex)
     return pageIndex === undefined ? [] : [{ ...record, pageIndex }]
   })
@@ -146,6 +162,25 @@ const SUBTYPE: Record<MarkupInput['type'], string> = {
   highlight: 'Highlight',
   underline: 'Underline',
   strikeout: 'StrikeOut',
+}
+
+/**
+ * Markup inputs arrive from the renderer/AI layer: reject colors outside 0-1,
+ * empty quad lists, and non-finite quad coordinates before they reach the
+ * appearance stream (Math.min(...[]) is Infinity, NaN poisons BBox/Rect).
+ */
+function validMarkup(m: MarkupInput): boolean {
+  if (!Array.isArray(m.color) || m.color.length !== 3) return false
+  if (!m.color.every((c) => typeof c === 'number' && Number.isFinite(c) && c >= 0 && c <= 1)) {
+    return false
+  }
+  if (!Array.isArray(m.quads) || m.quads.length === 0) return false
+  return m.quads.every(
+    (q) =>
+      Array.isArray(q) &&
+      q.length === 8 &&
+      q.every((v) => typeof v === 'number' && Number.isFinite(v)),
+  )
 }
 
 function addMarkup(pdfDoc: PDFDocument, page: PDFPage, m: MarkupInput): void {
@@ -294,7 +329,94 @@ function findNoteAnnotRef(
   return matches[0] ?? null
 }
 
-/** Drawing annots: hand-written AP for Ink/Square/Circle/Line; notes are standard Text annots (viewer draws the icon) */
+/** A note icon: the familiar rounded speech bubble with a tail and a few text
+ *  rules, so it reads as a comment rather than as a bare swatch. Geometry is in
+ *  the annotation rect (inset by half the stroke so the border stays inside).
+ *
+ *  The appearance form needs its own /Resources dictionary. A Form XObject with
+ *  no /Resources key at all leaves Quartz drawing this note dark grey
+ *  (`1 0.9 0.3 rg` read as the single value 0.3) while Poppler draws it yellow,
+ *  so the note shows up in one viewer and not the other. markupAppearance never
+ *  hit this because it always passes a Resources object; naming the colour
+ *  space as well keeps the result independent of the page's default. */
+function noteAppearance(
+  pdfDoc: PDFDocument,
+  rect: number[],
+  color: [number, number, number],
+): ReturnType<typeof pdfDoc.context.stream> {
+  const [x0, y0, x1, y1] = rect as [number, number, number, number]
+  const [r, g, b] = color
+  const w = x1 - x0
+  const h = y1 - y0
+  // the layout below is authored against a 20x18 icon, scaled to the actual rect
+  const sx = w / 20
+  const sy = h / 18
+  const p = (vx: number, vy: number) => `${num(x0 + vx * sx)} ${num(y0 + vy * sy)}`
+  const line = 0.75 * Math.min(sx, sy)
+  const dark = (f: number) => `${num(r * f)} ${num(g * f)} ${num(b * f)}`
+
+  // bubble body, with the tail notched into the bottom-left corner
+  const body = [
+    `${p(1, 4.5)} m`,
+    `${p(1, 0.5)} l`,
+    `${p(6, 4.5)} l`,
+    `${p(17.5, 4.5)} l`,
+    `${p(20, 8)} l`,
+    `${p(20, 15.5)} l`,
+    `${p(17.5, 18)} l`,
+    `${p(2.5, 18)} l`,
+    `${p(0, 15.5)} l`,
+    `${p(0, 8)} l`,
+    `${p(1, 4.5)} l`,
+    'B',
+  ].join('\n')
+
+  const rules = [5.5, 9, 12.5]
+    .map((y, i) => `${p(3.5, y)} m ${p(i === 1 ? 13 : 16.5, y)} l S`)
+    .join('\n')
+
+  const ops = [
+    '/NoteRGB CS',
+    `${dark(0.62)} SCN`,
+    `${num(line)} w`,
+    '/NoteRGB cs',
+    `${num(r)} ${num(g)} ${num(b)} scn`,
+    body,
+    `${dark(0.62)} SCN`,
+    `${num(line * 0.7)} w`,
+    rules,
+  ]
+  return pdfDoc.context.stream(ops.join('\n'), {
+    Type: 'XObject',
+    Subtype: 'Form',
+    BBox: rect,
+    Resources: { ColorSpace: { NoteRGB: 'DeviceRGB' } },
+  })
+}
+
+/**
+ * The popup rectangle Word/Acrobat pair with a sticky note: a note-sized box
+ * docked just outside the icon, flipped to the icon's left when the right edge
+ * would run off the page. A viewer only knows where a note's text belongs
+ * through /Popup, so without this there is nothing to open.
+ */
+function notePopupRect(
+  page: PDFPage,
+  rect: [number, number, number, number],
+): [number, number, number, number] {
+  const [x0, y0, x1] = rect
+  const { width, height } = page.getSize()
+  const w = Math.min(200, width)
+  const h = Math.min(120, height)
+  const y = Math.max(0, Math.min(y0, height - h))
+  const right = x1 + 2
+  const x = right + w <= width ? right : Math.max(0, x0 - w - 2)
+  return [x, y, Math.min(x + w, width), y + h]
+}
+
+/** Drawing annots: hand-written AP for Ink/Square/Circle/Line; notes get an AP
+ *  icon and a /Popup so other viewers (Preview, Chrome/pdf.js) can draw and open
+ *  them instead of relying on viewer built-ins. */
 function addDrawing(
   pdfDoc: PDFDocument,
   page: PDFPage,
@@ -307,14 +429,16 @@ function addDrawing(
 
   if (d.kind === 'note') {
     const [x, y] = d.at
+    const rect: [number, number, number, number] = [x, y - 18, x + 20, y]
     const annot = pdfDoc.context.obj({
       Type: 'Annot',
       Subtype: 'Text',
-      Rect: [num(x), num(y - 18), num(x + 20), num(y)],
+      Rect: rect.map(num),
       Name: 'Comment',
       C: d.color,
       F: 4,
       P: page.ref,
+      AP: { N: pdfDoc.context.register(noteAppearance(pdfDoc, rect, d.color)) },
     })
     annot.set(PDFName.of('Contents'), PDFHexString.fromText(d.contents))
     annot.set(PDFName.of('T'), PDFHexString.fromText(d.author || 'GenOffice'))
@@ -334,6 +458,19 @@ function addDrawing(
     }
     const ref = pdfDoc.context.register(annot)
     if (d.localId) noteRefs?.set(d.localId, ref)
+    // The popup is a direct child of the note, never a page /Annots entry
+    // (PDF 32000-1 12.5.5): viewers find it only through this /Popup key.
+    const popupRect = notePopupRect(page, rect)
+    const popup = pdfDoc.context.obj({
+      Type: 'Annot',
+      Subtype: 'Popup',
+      Rect: popupRect.map(num),
+      Parent: ref,
+      Open: false,
+      F: 4,
+    })
+    popup.set(PDFName.of('Contents'), PDFHexString.fromText(d.contents))
+    annot.set(PDFName.of('Popup'), popup)
     appendAnnot(pdfDoc, page, ref)
     return
   }
@@ -521,8 +658,14 @@ export async function mergePagesBytes(
   const total = src.getPageCount()
   const first = src.getPage(0)
   const { cols, rows } = mergeGrid(perSheet)
-  const sheetW = perSheet === 2 ? first.getHeight() : first.getWidth()
-  const sheetH = perSheet === 2 ? first.getWidth() : first.getHeight()
+  const normalizeRotation = (angle: number): number =>
+    (((Math.round(angle / 90) * 90) % 360) + 360) % 360
+  const firstRotation = normalizeRotation(first.getRotation().angle)
+  const firstTurns = firstRotation === 90 || firstRotation === 270
+  const firstDisplayW = firstTurns ? first.getHeight() : first.getWidth()
+  const firstDisplayH = firstTurns ? first.getWidth() : first.getHeight()
+  const sheetW = perSheet === 2 ? firstDisplayH : firstDisplayW
+  const sheetH = perSheet === 2 ? firstDisplayW : firstDisplayH
   // embedPages throws on pages without a content stream (e.g. our own inserted
   // blank pages) — give those an empty stream so they embed as empty cells
   for (const p of src.getPages()) {
@@ -537,17 +680,40 @@ export async function mergePagesBytes(
     const sheet = out.addPage([sheetW, sheetH])
     for (let i = 0; i < perSheet && start + i < total; i++) {
       const ep = embedded[start + i]!
-      const scale = Math.min(cellW / ep.width, cellH / ep.height)
+      const sourcePage = src.getPage(start + i)
+      const rotation = normalizeRotation(sourcePage.getRotation().angle)
+      const turns = rotation === 90 || rotation === 270
+      const displayW = turns ? ep.height : ep.width
+      const displayH = turns ? ep.width : ep.height
+      const scale = Math.min(cellW / displayW, cellH / displayH)
       const w = ep.width * scale
       const h = ep.height * scale
       const col = options.direction === 'vertical' ? Math.floor(i / rows) : i % cols
       const row = options.direction === 'vertical' ? i % rows : Math.floor(i / cols)
+      const cellX = col * cellW
+      const cellY = sheetH - (row + 1) * cellH
+      const x =
+        rotation === 90
+          ? cellX + (cellW - h) / 2
+          : rotation === 180
+            ? cellX + (cellW + w) / 2
+            : rotation === 270
+              ? cellX + (cellW + h) / 2
+              : cellX + (cellW - w) / 2
+      const y =
+        rotation === 90
+          ? cellY + (cellH + w) / 2
+          : rotation === 180
+            ? cellY + (cellH + h) / 2
+            : rotation === 270
+              ? cellY + (cellH - w) / 2
+              : cellY + (cellH - h) / 2
       sheet.drawPage(ep, {
-        x: col * cellW + (cellW - w) / 2,
-        // PDF y goes up: row 0 must land at the top of the sheet
-        y: sheetH - (row + 1) * cellH + (cellH - h) / 2,
-        width: w,
-        height: h,
+        x,
+        y,
+        xScale: scale,
+        yScale: scale,
+        rotate: degrees((360 - rotation) % 360),
       })
     }
     if (options.separator) {
@@ -909,7 +1075,7 @@ export async function applySaveRequest(
   }
   for (const m of request.markups) {
     const page = pages[m.pageIndex]
-    if (page) addMarkup(pdfDoc, page, m)
+    if (page && validMarkup(m)) addMarkup(pdfDoc, page, m)
   }
   const noteRefs = new Map<string, PDFRef>()
   for (const d of request.drawings ?? []) {
@@ -948,6 +1114,15 @@ export async function applySaveRequest(
     })
   }
   if (request.metadata) applyMetadata(pdfDoc, request.metadata)
+  // Page thumbnails and producer piece-info can retain a pre-redaction rendering of
+  // the same page. They are page-local derived data, so remove them for every affected
+  // page before the native final serialization.
+  for (const redaction of request.redactions ?? []) {
+    const page = pages[redaction.pageIndex]
+    if (!page) continue
+    page.node.delete(PDFName.of('Thumb'))
+    page.node.delete(PDFName.of('PieceInfo'))
+  }
   // Deletions go last, in descending order; earlier ops all address original page indices
   for (const idx of [...(request.deletedPages ?? [])].sort((a, b) => b - a)) {
     if (idx >= 0 && idx < pdfDoc.getPageCount() && pdfDoc.getPageCount() > 1) pdfDoc.removePage(idx)
@@ -977,8 +1152,12 @@ export async function applySaveRequest(
       )
   }
   try {
+    let saved = await pdfDoc.save({ useObjectStreams: false })
+    // Redaction is the final serializer. EmbedPDF's full SaveAsCopy writes only the
+    // reachable cleaned object graph; no subsequent pdf-lib pass can revive old streams.
+    if (request.redactions?.length) saved = await redactPdf(saved, request.redactions)
     return {
-      bytes: await pdfDoc.save({ useObjectStreams: false }),
+      bytes: saved,
       skippedTextEdits,
       skippedTextInserts,
       skippedImageEdits,
@@ -986,7 +1165,7 @@ export async function applySaveRequest(
   } catch (err) {
     // Form values beyond WinAnsi (e.g. CJK) make pdf-lib's appearance generation fail:
     // skip it and set NeedAppearances so viewers rebuild them (Acrobat/pdfjs both support this)
-    if (request.formValues.length === 0) throw err
+    if (request.formValues.length === 0 || request.redactions?.length) throw err
     pdfDoc.getForm().acroForm.dict.set(PDFName.of('NeedAppearances'), PDFBool.True)
     return {
       bytes: await pdfDoc.save({ useObjectStreams: false, updateFieldAppearances: false }),

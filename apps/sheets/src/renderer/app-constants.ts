@@ -3,8 +3,8 @@
  * vocabularies, Univer mutation/command names the edit journal listens to,
  * and the Home → Cell Styles presets. Extracted from App.tsx verbatim.
  */
-import type { CellFormatPatch } from '../domain/workbook-dsl'
-import type { WorkbookSnapshot } from '../domain/workbook.types'
+import type { CellFormatPatch } from '@genoffice/xlsx-gateway/domain/workbook-dsl'
+import type { WorkbookSnapshot } from '@genoffice/xlsx-gateway/domain/workbook.types'
 import type { ChartEditData } from './WorkbookVisuals'
 
 export const CHART_TYPE_COMMANDS = ['column', 'bar', 'line', 'area', 'pie', 'doughnut'] as const
@@ -117,7 +117,7 @@ export function getWorkbookMdw(): number {
 /// Univer column pixels → OOXML character width (inverse of
 /// characterWidthToPixels), snapped to the format's 1/256 granularity.
 export function pixelsToCharacterWidth(pixels: number): number {
-  return Math.max(Math.round(((pixels - 5) / workbookMdw) * 256) / 256, 1 / 256)
+  return Math.max(Math.round((pixels / workbookMdw) * 256) / 256, 1 / 256)
 }
 // Sorting reorders the model in place; the journal snapshots the sorted
 // range afterwards, so the save writes exactly what the screen shows.
@@ -126,6 +126,10 @@ export const REORDER_RANGE_MUTATION = 'sheet.mutation.reorder-range'
 // vacated source and the landing target as plain cell edits.
 export const MOVE_RANGE_MUTATION = 'sheet.mutation.move-range'
 export const MOVE_RANGE_COMMAND = 'sheet.command.move-range'
+// Insert/Delete Cells with a shift decompose into move-range + set-range-values
+// mutations, so they journal like a drag-move and share its load-mode gate.
+export const RANGE_SHIFT_COMMAND_PATTERN =
+  /^sheet\.command\.(insert|delete)-range-move-(left|right|up|down)$/
 export const CF_RULE_COMMAND_PATTERN = /^sheet\.command\.(add|set)-conditional-rule$/
 export const SORT_COMMAND_PATTERN =
   /^sheet\.command\.(sort-range|reorder-range|split-text-to-columns)$/

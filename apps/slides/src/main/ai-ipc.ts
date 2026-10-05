@@ -8,7 +8,6 @@ import { app, ipcMain, nativeImage, net, shell } from 'electron'
 import {
   appendFileSync,
   existsSync,
-  mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -23,9 +22,9 @@ import {
   isAiOverloadedError,
   defaultAiSettings,
   activeProvider,
-  cloudToolsEnabled,
   maxOutputTokensOf,
   resolveAiSettings,
+  sanitizeAiSettings,
   setAiUserAgent,
   setRescueFetch,
   streamForProvider,
@@ -36,20 +35,26 @@ import {
   type LegacyAiSettings,
 } from '@genoffice/ai-provider'
 import { shutdownCodexAppServers } from '@genoffice/ai-provider/codex-app-server'
-import { fetchRemoteImage } from '@genoffice/electron-utils'
 import {
-  webSearch,
-  imageSearch,
+  MAX_REMOTE_IMAGE_BYTES,
+  fetchRemoteImage,
+  readBodyCapped,
+  writeJsonAtomic,
+} from '@genoffice/electron-utils'
+import {
+  webSearchTool,
+  imageSearchTool,
   ensureGenofficeLogin,
   gskApiKey,
-  gskGenerateImage,
-  gskAnalyzeMedia,
+  generateImageTool,
+  analyzeMediaTool,
+  documentMediaRoots,
   gskLoginInfo,
   hasGskAuth,
 } from '@genoffice/ai-search'
 import { addPicture, editPictureSrcRect, replacePictureBytes } from '@genoffice/pptx-engine'
 import { matchesElementRef } from '@genoffice/pptx-engine/identity'
-import { coverCropFractions } from '../shared/cover-crop'
+import { coverCropFractions } from '@genoffice/pipelines/slides'
 import type { AiRunFailure } from '../shared/ipc'
 import { EMU_PER_PX_96 } from '@genoffice/pptx-render'
 import { tm } from './i18n-main'
@@ -59,9 +64,15 @@ import { pushHistory, rebuildSlide, scheduleHistoryNotify, sessions } from './se
 
 const AI_SETTINGS_PATH = () => join(app.getPath('userData'), 'ai-settings.json')
 
-/** live read: the shell settings pane writes the file; every tool call re-checks */
-function gskCloudToolsOn(): boolean {
-  return cloudToolsEnabled(readJson<Partial<AiSettings>>(AI_SETTINGS_PATH(), {}))
+/**
+ * Local media roots for a slides renderer: the open deck's directory plus the
+ * directory slides stages pasted images in. generate_image (referenceImageUrls)
+ * and analyze_media (mediaUrls) both take paths straight from the model, so
+ * only these two directories are readable — a reference or a media file the
+ * user put next to the deck they are editing, and nothing else.
+ */
+function slidesMediaRoots(wcId: number): string[] {
+  return documentMediaRoots(sessions.get(wcId)?.path, join(app.getPath('temp'), 'genoffice-pasted'))
 }
 
 function readJson<T>(path: string, fallback: T): T {
@@ -71,11 +82,6 @@ function readJson<T>(path: string, fallback: T): T {
     /* Corrupted state file: fall back to defaults */
   }
   return fallback
-}
-
-function writeJson(path: string, value: unknown): void {
-  mkdirSync(join(path, '..'), { recursive: true })
-  writeFileSync(path, JSON.stringify(value, null, 2))
 }
 
 const activeAiStreams = new Map<string, AbortController>()
@@ -137,7 +143,15 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:set-settings', (_event, settings: AiSettings) => {
-    writeJson(AI_SETTINGS_PATH(), settings)
+    // SECURITY.md: payloads are schema-checked in the main process. The settings
+    // file feeds cliPath into spawn() and baseUrl receives the gsk bearer token,
+    // so the renderer's copy is sanitized before it touches disk.
+    const sanitized = sanitizeAiSettings(settings)
+    if (!sanitized) {
+      console.warn('[ai] rejected invalid ai:set-settings payload')
+      return
+    }
+    writeJsonAtomic(AI_SETTINGS_PATH(), sanitized)
   })
 
   ipcMain.handle('ai:log-run-failure', (_event, entry: AiRunFailure) => {
@@ -145,7 +159,19 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:stream', async (event, request: AiStreamRequest) => {
-    const { requestId, settings, system, messages } = request
+    // per-request settings get the same schema check as the persisted ones: a
+    // compromised renderer could otherwise hand cliPath/baseUrl straight to
+    // the provider layer without ever touching the settings file
+    const settings = sanitizeAiSettings(request.settings)
+    if (!settings) {
+      event.sender.send('ai:stream-chunk', {
+        requestId: request.requestId,
+        type: 'error',
+        error: 'invalid AI settings payload',
+      } satisfies AiStreamChunk)
+      return
+    }
+    const { requestId, system, messages } = request
     const tools = request.tools ?? []
     const maxTokens = request.maxTokens ?? maxOutputTokensOf(settings)
     const provider = settings.provider
@@ -230,10 +256,10 @@ export function registerAiIpc(): void {
   // Search tools (content + images), Serper with DuckDuckGo fallback
   ipcMain.handle('ai:web-search', async (_event, query: string, maxResults?: number) => {
     try {
-      return await webSearch(
+      return await webSearchTool(
+        AI_SETTINGS_PATH(),
         String(query),
         typeof maxResults === 'number' ? maxResults : 6,
-        gskCloudToolsOn(),
       )
     } catch (err) {
       return { results: [], method: 'error', error: String(err) }
@@ -242,10 +268,10 @@ export function registerAiIpc(): void {
 
   ipcMain.handle('ai:image-search', async (_event, query: string, maxResults?: number) => {
     try {
-      return await imageSearch(
+      return await imageSearchTool(
+        AI_SETTINGS_PATH(),
         String(query),
         typeof maxResults === 'number' ? maxResults : 8,
-        gskCloudToolsOn(),
       )
     } catch (err) {
       return { images: [], method: 'error', error: String(err) }
@@ -263,23 +289,19 @@ export function registerSlidesOnlyAiIpc(): void {
   ipcMain.handle(
     'ai:generate-image',
     async (
-      _event,
+      event,
       op: {
         prompt: string
         model?: string
         referenceImageUrls?: string[]
         aspectRatio?: string
         imageSize?: string
+        transparentBackground?: boolean
       },
     ) => {
-      if (!hasGskAuth()) return { error: tm('errGskCli') }
-      if (!gskCloudToolsOn())
-        return {
-          error:
-            'Genspark cloud tools are turned off in Settings (AI Model); enable them to use this tool',
-        }
-      try {
-        const r = await gskGenerateImage({
+      return generateImageTool(
+        AI_SETTINGS_PATH(),
+        {
           prompt: String(op.prompt),
           model: op.model ? String(op.model) : undefined,
           referenceImageUrls: Array.isArray(op.referenceImageUrls)
@@ -287,34 +309,49 @@ export function registerSlidesOnlyAiIpc(): void {
             : undefined,
           aspectRatio: op.aspectRatio ? String(op.aspectRatio) : undefined,
           imageSize: op.imageSize ? String(op.imageSize) : undefined,
-        })
-        return { url: r.url }
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : String(err) }
-      }
+          transparentBackground: op.transparentBackground === true,
+        },
+        {
+          notLoggedInError: tm('errGskCli'),
+          mediaRoots: slidesMediaRoots(event.sender.id),
+        },
+      )
     },
   )
 
   ipcMain.handle(
     'ai:analyze-media',
-    async (_event, op: { mediaUrls: string[]; requirements: string }) => {
-      if (!hasGskAuth()) return { error: tm('errGskCli') }
-      if (!gskCloudToolsOn())
-        return {
-          error:
-            'Genspark cloud tools are turned off in Settings (AI Model); enable them to use this tool',
-        }
-      try {
-        const text = await gskAnalyzeMedia({
+    async (event, op: { mediaUrls: string[]; requirements: string }) => {
+      return analyzeMediaTool(
+        AI_SETTINGS_PATH(),
+        {
           mediaUrls: (op.mediaUrls ?? []).map(String),
           requirements: String(op.requirements ?? ''),
-        })
-        return { text }
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : String(err) }
-      }
+        },
+        {
+          notLoggedInError: tm('errGskCli'),
+          mediaRoots: slidesMediaRoots(event.sender.id),
+        },
+      )
     },
   )
+
+  /** Bytes of a user attachment the renderer resolved (attachment://): keep
+   *  pptx-native formats as-is, convert anything else (webp/bmp/…) to PNG. */
+  const attachmentImageBytes = (
+    base64: string,
+    ext: string,
+  ): { buf: Buffer; ext: string } | null => {
+    const buf = Buffer.from(String(base64), 'base64')
+    if (!buf.length) return null
+    const norm = String(ext)
+      .toLowerCase()
+      .replace(/^jpeg$/, 'jpg')
+    if (norm === 'png' || norm === 'gif' || norm === 'jpg') return { buf, ext: norm }
+    const img = nativeImage.createFromBuffer(buf)
+    if (img.isEmpty()) return null
+    return { buf: img.toPNG(), ext: 'png' }
+  }
 
   // Download an image from a URL and insert it into the given page (image search -> insert in one step; download in the main process avoids CORS)
   ipcMain.handle(
@@ -323,7 +360,10 @@ export function registerSlidesOnlyAiIpc(): void {
       e,
       op: {
         slideIndex: number
-        url: string
+        url?: string
+        /** raw base64 of a user attachment (attachment:// reference) — no network fetch */
+        base64?: string
+        ext?: string
         xPx: number
         yPx: number
         wPx: number
@@ -336,15 +376,23 @@ export function registerSlidesOnlyAiIpc(): void {
       const slide = session.opened.deck.slides[op.slideIndex]
       if (!slide) return null
       try {
-        // the URL originates from AI tool calls (prompt-injectable via image
-        // search results), so refuse non-http schemes and private/link-local
-        // targets; redirects are followed manually so every hop is validated.
-        // fetchRemoteImage adds CDN-friendly headers and transient-error retries.
-        const resp = await fetchRemoteImage(String(op.url))
-        if (!resp || !resp.ok) return null
-        const buf = Buffer.from(await resp.arrayBuffer())
-        const ct = resp.headers.get('content-type') ?? ''
-        const ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        let buf: Buffer
+        let ext: string
+        if (op.base64 != null) {
+          const decoded = attachmentImageBytes(op.base64, op.ext ?? '')
+          if (!decoded) return null
+          ;({ buf, ext } = decoded)
+        } else {
+          // the URL originates from AI tool calls (prompt-injectable via image
+          // search results), so refuse non-http schemes and private/link-local
+          // targets; redirects are followed manually so every hop is validated.
+          // fetchRemoteImage adds CDN-friendly headers and transient-error retries.
+          const resp = await fetchRemoteImage(String(op.url))
+          if (!resp || !resp.ok) return null
+          buf = Buffer.from(await readBodyCapped(resp, MAX_REMOTE_IMAGE_BYTES))
+          const ct = resp.headers.get('content-type') ?? ''
+          ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        }
         const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
         const scale = op.fitWidthPx / baseWidthPx
         const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
@@ -383,7 +431,18 @@ export function registerSlidesOnlyAiIpc(): void {
   // (frame/z-order/effects survive). Same URL hardening as ai:insert-image-url.
   ipcMain.handle(
     'ai:replace-picture-url',
-    async (e, op: { slideIndex: number; sourceId: string; url: string; keepSrcRect?: boolean }) => {
+    async (
+      e,
+      op: {
+        slideIndex: number
+        sourceId: string
+        url?: string
+        /** raw base64 of a user attachment (attachment:// reference) — no network fetch */
+        base64?: string
+        ext?: string
+        keepSrcRect?: boolean
+      },
+    ) => {
       const session = sessions.get(e.sender.id)
       if (!session) return null
       const slide = session.opened.deck.slides[op.slideIndex]
@@ -394,11 +453,19 @@ export function registerSlidesOnlyAiIpc(): void {
         slide.elements.find((el) => matchesElementRef(el, String(op.sourceId)))?.id ??
         String(op.sourceId)
       try {
-        const resp = await fetchRemoteImage(String(op.url))
-        if (!resp || !resp.ok) return null
-        const buf = Buffer.from(await resp.arrayBuffer())
-        const ct = resp.headers.get('content-type') ?? ''
-        const ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        let buf: Buffer
+        let ext: string
+        if (op.base64 != null) {
+          const decoded = attachmentImageBytes(op.base64, op.ext ?? '')
+          if (!decoded) return null
+          ;({ buf, ext } = decoded)
+        } else {
+          const resp = await fetchRemoteImage(String(op.url))
+          if (!resp || !resp.ok) return null
+          buf = Buffer.from(await readBodyCapped(resp, MAX_REMOTE_IMAGE_BYTES))
+          const ct = resp.headers.get('content-type') ?? ''
+          ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        }
         pushHistory(session)
         const ok = replacePictureBytes(
           session.opened,
@@ -456,18 +523,18 @@ export function registerSlidesOnlyAiIpc(): void {
 
   ipcMain.handle(
     'ai:save-style-template',
-    (
+    async (
       _event,
       name: string,
-      data: { topic: string; styleSkill: string; createdAt: string },
-    ): { ok: boolean; error?: string } => {
+      data: { topic: string; styleSkill: string; createdAt: string; layout?: unknown },
+    ): Promise<{ ok: boolean; error?: string }> => {
       try {
         const dir = STYLE_TEMPLATES_DIR()
-        mkdirSync(dir, { recursive: true })
         // Filename: replace illegal characters in the name with _ then truncate to 64 chars
         const safeName = name.replace(/[/\\:*?"<>|]/g, '_').slice(0, 64)
         if (!safeName) return { ok: false, error: tm('errTplNameInvalid') }
-        writeJson(join(dir, `${safeName}.json`), { ...data, name: safeName })
+        // `layout` (the deck's chrome skeleton) rides along verbatim when present
+        writeJsonAtomic(join(dir, `${safeName}.json`), { ...data, name: safeName })
         return { ok: true }
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
@@ -514,15 +581,23 @@ export function registerSlidesOnlyAiIpc(): void {
     (
       _event,
       name: string,
-    ): { ok: boolean; styleSkill?: string; topic?: string; error?: string } => {
+    ): { ok: boolean; styleSkill?: string; topic?: string; layout?: unknown; error?: string } => {
       try {
         const dir = STYLE_TEMPLATES_DIR()
         const safeName = name.replace(/[/\\:*?"<>|]/g, '_').slice(0, 64)
         const filePath = join(dir, `${safeName}.json`)
         if (!existsSync(filePath)) return { ok: false, error: tm('errTplMissing', { name }) }
-        const raw = readJson<{ styleSkill?: string; topic?: string }>(filePath, {})
+        const raw = readJson<{ styleSkill?: string; topic?: string; layout?: unknown }>(
+          filePath,
+          {},
+        )
         if (!raw.styleSkill) return { ok: false, error: tm('errTplNoSkill', { name }) }
-        return { ok: true, styleSkill: raw.styleSkill, topic: raw.topic ?? '' }
+        return {
+          ok: true,
+          styleSkill: raw.styleSkill,
+          topic: raw.topic ?? '',
+          ...(raw.layout !== undefined && raw.layout !== null ? { layout: raw.layout } : {}),
+        }
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
       }

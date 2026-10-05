@@ -84,6 +84,7 @@ function glyphOf(face: ParsedFace, cp: number): number {
   }
   // format 4: BMP only
   if (cp > 0xffff) return 0
+  if (sub.length < 8) return 0
   const segCountX2 = sub.readUInt16BE(6)
   const endBase = 14
   const startBase = endBase + segCountX2 + 2
@@ -93,17 +94,23 @@ function glyphOf(face: ParsedFace, cp: number): number {
   let hi = segCountX2 / 2 - 1
   while (lo <= hi) {
     const mid = (lo + hi) >> 1
+    // segCountX2 is self-declared, so a truncated subtable can run out of bytes
+    // part-way through the four segment arrays. Check each base before reading
+    // it: unlike parseFaceAdvances, glyphOf runs outside any try/catch, so a
+    // crafted font would throw out of advanceWidths' caller.
     if (endBase + 2 * mid + 2 > sub.length) return 0
     const end = sub.readUInt16BE(endBase + 2 * mid)
     if (cp > end) {
       lo = mid + 1
       continue
     }
+    if (startBase + 2 * mid + 2 > sub.length) return 0
     const start = sub.readUInt16BE(startBase + 2 * mid)
     if (cp < start) {
       hi = mid - 1
       continue
     }
+    if (rangeBase + 2 * mid + 2 > sub.length) return 0
     const delta = sub.readInt16BE(deltaBase + 2 * mid)
     const rangeOff = sub.readUInt16BE(rangeBase + 2 * mid)
     if (rangeOff === 0) return (cp + delta) & 0xffff
@@ -143,6 +150,20 @@ const styleTokensOf = (style: AdvanceStyle): string[] => [
 const faceCache = new Map<string, ParsedFace | null>()
 const FACE_CACHE_MAX = 8
 
+/**
+ * Make room for one entry, evicting the least-recently-inserted one.
+ * Map preserves insertion order, so the first key is the oldest. Evicting
+ * one entry (instead of clearing the whole cache) keeps the other parsed
+ * faces hot when a document cycles through more families than fit.
+ */
+export function evictOldestEntry<K, V>(cache: Map<K, V>, max: number): void {
+  while (cache.size >= max) {
+    const oldest = cache.keys().next()
+    if (oldest.done) return
+    cache.delete(oldest.value)
+  }
+}
+
 function faceAdvances(face: FaceRef): ParsedFace | null {
   const key = `${face.path}#${face.offset}`
   const hit = faceCache.get(key)
@@ -158,7 +179,7 @@ function faceAdvances(face: FaceRef): ParsedFace | null {
   } catch {
     return null // transient open/read failure: not cached, retried next call
   }
-  if (faceCache.size >= FACE_CACHE_MAX) faceCache.clear()
+  evictOldestEntry(faceCache, FACE_CACHE_MAX)
   faceCache.set(key, parsed)
   return parsed
 }

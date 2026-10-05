@@ -11,6 +11,7 @@ export {
   IconBullets,
   IconCaret,
   IconNumbered,
+  IconOutlineView,
   IconIndentDec,
   IconIndentInc,
   IconTable,
@@ -20,6 +21,8 @@ export {
   IconUndo,
   IconRedo,
   IconCopy,
+  IconSearch,
+  IconSpellcheck,
 } from '../../../../docs/src/renderer/components/icons'
 
 interface IconProps {
@@ -67,6 +70,17 @@ export function IconHr(props: IconProps) {
     <Svg {...props}>
       <path d="M2 8h12" />
       <path d="M4.5 4.2h7M4.5 11.8h7" opacity="0.45" />
+    </Svg>
+  )
+}
+
+/* raw-text lines with a caret — reads as "the text itself", and stays clear of
+ * the chevron pair IconInlineCode already uses for inline-code formatting */
+export function IconSourceCode(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M2.2 3.4h11.6M2.2 6.6h7.2M2.2 9.8h11.6M2.2 13h5.4" opacity="0.55" />
+      <path d="M12.4 9.4v3.2" strokeWidth="1.4" />
     </Svg>
   )
 }

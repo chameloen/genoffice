@@ -3,8 +3,10 @@ import {
   AI_PROVIDER_ADAPTERS,
   getProviderAdapter,
   modelEchoesReasoning,
+  modelHasFixedSampling,
   modelLacksVision,
 } from '../src/registry'
+import { endpointUrl } from '../src/protocols/shared'
 import { AI_PROVIDERS, GENSPARK_LLM_BASE_URLS } from '../src/providers'
 import type { AiProviderConfig, AiProviderId } from '../src/types'
 
@@ -48,12 +50,18 @@ describe('provider registry', () => {
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
       omitTemperature: true,
     })
-    // thinking stays off: once tools are in play DeepSeek 400s any turn that
-    // does not echo back the reasoning_content our transcript cannot carry
+    // no thinking override: both models think by default and the transcript
+    // round-trips the reasoning (live-API verified 2026-09-30 — the tool-turn
+    // 400 that once forced non-thinking no longer reproduces)
     expect(AI_PROVIDER_ADAPTERS.deepseek.resolveEndpoint(config('deepseek-v4-pro'))).toEqual({
       protocol: 'openai-compatible',
       baseUrl: 'https://api.deepseek.com/v1',
-      bodyExtras: { thinking: { type: 'disabled' } },
+    })
+    // the listed V4.1 Flash name is the pool spelling; the vendor only serves `deepseek-flash`
+    expect(AI_PROVIDER_ADAPTERS.deepseek.resolveEndpoint(config('deep-seek-v4.1-flash'))).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://api.deepseek.com/v1',
+      model: 'deepseek-flash',
     })
     expect(AI_PROVIDER_ADAPTERS.openai.resolveEndpoint(config('gpt-4.1-mini'))).toEqual({
       protocol: 'openai-compatible',
@@ -62,8 +70,8 @@ describe('provider registry', () => {
     })
   })
 
-  it('marks the GPT-5 family as fixed-sampling (rejects any non-default temperature)', () => {
-    for (const model of ['gpt-5.6', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4-mini']) {
+  it('marks the GPT-5/GPT-6 families as fixed-sampling (reject any non-default temperature)', () => {
+    for (const model of ['gpt-6-astra', 'gpt-5.6', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4-mini']) {
       expect(AI_PROVIDER_ADAPTERS.openai.resolveEndpoint(config(model))).toEqual({
         protocol: 'openai-compatible',
         baseUrl: 'https://api.openai.com/v1',
@@ -90,15 +98,38 @@ describe('provider registry', () => {
     })
   })
 
+  it('does not over-match fixed-sampling prefixes (o10, o30, o4-minix)', () => {
+    expect(modelHasFixedSampling('o10')).toBe(false)
+    expect(modelHasFixedSampling('o30')).toBe(false)
+    expect(modelHasFixedSampling('o4-minix')).toBe(false)
+    expect(modelHasFixedSampling('gpt-50')).toBe(false)
+  })
+
   it('resolves the catalog additions to their OpenAI-compatible endpoints', () => {
     const cases: Array<[AiProviderId, string, string]> = [
       ['glm', 'glm-5.3', 'https://open.bigmodel.cn/api/paas/v4'],
       ['qwen', 'qwen3.8-max', 'https://dashscope.aliyuncs.com/compatible-mode/v1'],
       ['doubao', 'doubao-seed-2-1-pro-260628', 'https://ark.cn-beijing.volces.com/api/v3'],
+      ['mimo', 'mimo-v2.6-pro', 'https://api.xiaomimimo.com/v1'],
+      ['mimo', 'mimo-v2.6-flash', 'https://api.xiaomimimo.com/v1'],
+      ['hunyuan', 'hy3', 'https://tokenhub.tencentmaas.com/v1'],
+      ['hunyuan', 'hy4-preview', 'https://tokenhub.tencentmaas.com/v1'],
+      ['ling', 'Ling-3.0-flash', 'https://api.ant-ling.com/v1'],
+      ['ling', 'Ling-3.0-flash-VL', 'https://api.ant-ling.com/v1'],
+      ['ling', 'Ling-3.0-tiny', 'https://api.ant-ling.com/v1'],
+      ['ling', 'Ling-2.6-1T', 'https://api.ant-ling.com/v1'],
+      ['ling', 'Ring-2.6-1T', 'https://api.ant-ling.com/v1'],
+      ['ling', 'Ling-2.6-flash', 'https://api.ant-ling.com/v1'],
+      ['spark', 'spark-x2.5', 'https://maas-api.cn-huabei-1.xf-yun.com/v2'],
+      ['longcat', 'LongCat-2.5-Preview', 'https://api.longcat.chat/openai/v1'],
+      ['longcat', 'LongCat-2.0', 'https://api.longcat.chat/openai/v1'],
       ['minimax', 'MiniMax-M3', 'https://api.minimax.io/v1'],
       ['xai', 'grok-4.6', 'https://api.x.ai/v1'],
       ['mistral', 'mistral-large-latest', 'https://api.mistral.ai/v1'],
       ['openrouter', 'openrouter/auto', 'https://openrouter.ai/api/v1'],
+      ['requesty', 'claude-sonnet-5', 'https://router.requesty.ai/v1'],
+      ['opper', 'claude-sonnet-4-6', 'https://api.opper.ai/v3/compat'],
+      ['cheaperinference', 'claude-sonnet-5', 'https://api.cheaperinference.com/v1'],
     ]
     for (const [id, model, baseUrl] of cases) {
       expect(AI_PROVIDER_ADAPTERS[id].resolveEndpoint(config(model))).toEqual({
@@ -106,6 +137,57 @@ describe('provider registry', () => {
         baseUrl,
       })
     }
+  })
+
+  // Pins the exact strings the three providers' vendor docs give, so a later
+  // "I could not find it" pass cannot quietly reintroduce the wrong host or
+  // the old capitalisation.
+  it('pins the Spark host, model id and key prefix to the iFlytek product guide', () => {
+    const spark = AI_PROVIDERS.find((p) => p.id === 'spark')!
+    // the guide's examples read `model: spark-x2.5` and `ak-f30b1****...`:
+    // lower case on the model, `ak-` on the key
+    expect(spark.models).toEqual(['spark-x2.5'])
+    expect(spark.defaultModel).toBe('spark-x2.5')
+    expect(spark.keyPlaceholder).toBe('ak-...')
+    // the guide's chat endpoint is POST .../v2/chat/completions on the Huabei
+    // MaaS host, which is the retired spark-api-open.xf-yun.com host's successor
+    const endpoint = AI_PROVIDER_ADAPTERS.spark.resolveEndpoint(config('spark-x2.5'))
+    expect(endpoint.baseUrl).toBe('https://maas-api.cn-huabei-1.xf-yun.com/v2')
+    // the base alone is half a URL: the composed request must be the documented
+    // one, or every Spark call 404s
+    expect(endpointUrl(endpoint.baseUrl, 'chat/completions')).toBe(
+      'https://maas-api.cn-huabei-1.xf-yun.com/v2/chat/completions',
+    )
+    for (const wrong of ['Spark-X2.5', 'spark-api-open.xf-yun.com']) {
+      expect(spark.models.join(' ')).not.toContain(wrong)
+      expect(spark.defaultModel).not.toContain(wrong)
+      expect(
+        AI_PROVIDER_ADAPTERS.spark.resolveEndpoint(config('spark-x2.5')).baseUrl,
+      ).not.toContain(wrong)
+    }
+  })
+
+  it('pins the LongCat model ids to the official pricing pages', () => {
+    const longcat = AI_PROVIDERS.find((p) => p.id === 'longcat')!
+    // the pricing pages spell these exactly this way
+    expect(longcat.models).toEqual(['LongCat-2.5-Preview', 'LongCat-2.0'])
+    for (const model of longcat.models) {
+      expect(AI_PROVIDER_ADAPTERS.longcat.resolveEndpoint(config(model))).toEqual({
+        protocol: 'openai-compatible',
+        baseUrl: 'https://api.longcat.chat/openai/v1',
+      })
+    }
+    // the lower-case pool spelling is the OpenCode Go route, not this provider
+    expect(longcat.models).not.toContain('longcat-2.0')
+    expect(longcat.models).not.toContain('longcat-2.5-preview')
+  })
+
+  it('keeps the Ling ids off this first-party endpoint and the corrected omissions visible', () => {
+    const ling = AI_PROVIDERS.find((p) => p.id === 'ling')!
+    // the Options column re-read 2026-10-01 lists no 3.1, so 3.1 stays out
+    expect(ling.models).not.toContain('Ling-3.1-flash')
+    // Ling-3.0-flash-VL is documented and is the multimodal member
+    expect(ling.models).toContain('Ling-3.0-flash-VL')
   })
 
   it('marks Kimi as fixed-sampling (K3 rejects any temperature but 1)', () => {
@@ -180,13 +262,25 @@ describe('provider registry', () => {
   it('routes OpenCode Go with its own table (MiniMax rides Messages there, not chat-completions)', () => {
     const resolve = (model: string) =>
       AI_PROVIDER_ADAPTERS['opencode-go'].resolveEndpoint(config(model))
-    for (const model of ['minimax-m3', 'qwen3.8-flash']) {
+    for (const model of ['minimax-m3', 'minimax-m2.7', 'qwen3.8-flash']) {
       expect(resolve(model)).toEqual({
         protocol: 'anthropic',
         baseUrl: 'https://opencode.ai/zen/go',
       })
     }
-    for (const model of ['glm-5.3', 'deepseek-v4-flash', 'qwen3.8-max', 'longcat-2.0']) {
+    for (const model of [
+      'glm-5.3',
+      'glm-5.2',
+      'deepseek-v4-flash',
+      'deepseek-v4.1-flash',
+      'qwen3.8-max',
+      'longcat-2.0',
+      'longcat-2.5-preview-free',
+      'mimo-v2.6-pro',
+      'mimo-v2.6-flash',
+      'hy4-preview',
+      'hy3',
+    ]) {
       expect(resolve(model)).toEqual({
         protocol: 'openai-compatible',
         baseUrl: 'https://opencode.ai/zen/go/v1',
@@ -197,8 +291,22 @@ describe('provider registry', () => {
       baseUrl: 'https://opencode.ai/zen/go/v1',
       omitTemperature: true,
     })
+    expect(resolve('kimi-k2.6')).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      omitTemperature: true,
+    })
     // Go has no Gemini route
     expect(resolve('gemini-3.7-flash').protocol).toBe('openai-compatible')
+  })
+
+  it('does not crash the opencode route on a missing model id', () => {
+    const zen = AI_PROVIDER_ADAPTERS['opencode-zen'].resolveEndpoint({
+      apiKey: 'k',
+      model: undefined as unknown as string,
+    })
+    expect(zen.protocol).toBe('openai-compatible')
+    expect(zen.omitTemperature).toBeUndefined()
   })
 
   it('uses the configured base URL for custom and rejects a missing one', () => {
@@ -208,6 +316,19 @@ describe('provider registry', () => {
     expect(() => AI_PROVIDER_ADAPTERS.custom.resolveEndpoint(config('m'))).toThrow(
       'A custom provider requires a Base URL',
     )
+  })
+
+  it('rejects non-http and oversized custom base URLs', () => {
+    const resolve = (baseUrl: string) =>
+      AI_PROVIDER_ADAPTERS.custom.resolveEndpoint(config('m', baseUrl))
+    expect(() => resolve('javascript:alert(1)')).toThrow('http or https')
+    expect(() => resolve('file:///etc/passwd')).toThrow('http or https')
+    expect(() => resolve('not a url')).toThrow('valid http')
+    expect(() => resolve(`https://x/${'a'.repeat(3000)}`)).toThrow('2048')
+    // a regional mirror with whitespace still resolves to the trimmed URL
+    expect(
+      AI_PROVIDER_ADAPTERS.custom.resolveEndpoint(config('m', '  https://mirror/v1  ')).baseUrl,
+    ).toBe('https://mirror/v1')
   })
 
   it('only genspark authenticates through the gsk login', () => {
@@ -273,6 +394,62 @@ describe('fixed-sampling models on indirect routes', () => {
       omitTemperature: true,
     })
   })
+
+  it('omits temperature for fixed-sampling pools via Opper', () => {
+    const resolve = (model: string) => AI_PROVIDER_ADAPTERS.opper.resolveEndpoint(config(model))
+    for (const model of ['kimi-k3', 'gpt-5.5', 'gemini-3.8-flash', 'openai/gpt-5']) {
+      expect(resolve(model)).toEqual({
+        protocol: 'openai-compatible',
+        baseUrl: 'https://api.opper.ai/v3/compat',
+        omitTemperature: true,
+      })
+    }
+    // pool names and pinned vendor routes share the endpoint; sampling is unrestricted here
+    for (const model of ['claude-sonnet-4-6', 'anthropic/claude-sonnet-4-6']) {
+      expect(resolve(model)).toEqual({
+        protocol: 'openai-compatible',
+        baseUrl: 'https://api.opper.ai/v3/compat',
+      })
+    }
+  })
+
+  it('omits temperature for fixed-sampling managed policies via Requesty', () => {
+    const resolve = (model: string, baseUrl?: string) =>
+      AI_PROVIDER_ADAPTERS.requesty.resolveEndpoint(config(model, baseUrl))
+    for (const model of ['kimi-k3', 'gpt-5.6-sol', 'gemini-3.7-flash', 'openai/gpt-5.4']) {
+      expect(resolve(model)).toEqual({
+        protocol: 'openai-compatible',
+        baseUrl: 'https://router.requesty.ai/v1',
+        omitTemperature: true,
+      })
+    }
+    // the full-catalog vendor-prefixed ids work as-is on the same endpoint
+    expect(resolve('openai/gpt-4o-mini')).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://router.requesty.ai/v1',
+    })
+    // a stored base URL picks the EU router
+    expect(resolve('claude-sonnet-5', 'https://router.eu.requesty.ai/v1')).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://router.eu.requesty.ai/v1',
+    })
+  })
+
+  it('omits temperature for fixed-sampling models via Cheaper Inference', () => {
+    const resolve = (model: string) =>
+      AI_PROVIDER_ADAPTERS.cheaperinference.resolveEndpoint(config(model))
+    for (const model of ['gpt-5.4-mini', 'gpt-5.4', 'gemini-3.1-pro']) {
+      expect(resolve(model)).toEqual({
+        protocol: 'openai-compatible',
+        baseUrl: 'https://api.cheaperinference.com/v1',
+        omitTemperature: true,
+      })
+    }
+    expect(resolve('claude-sonnet-5')).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://api.cheaperinference.com/v1',
+    })
+  })
 })
 
 describe('modelLacksVision', () => {
@@ -281,9 +458,51 @@ describe('modelLacksVision', () => {
     expect(modelLacksVision('deep-seek-v4-flash-baseten')).toBe(true)
     expect(modelLacksVision('deepseek-v4-pro')).toBe(true)
     expect(modelLacksVision('deepseek-v4-flash')).toBe(true)
+    expect(modelLacksVision('deep-seek-v4-pro')).toBe(true)
+    expect(modelLacksVision('deep-seek-v4.1-flash')).toBe(false)
     expect(modelLacksVision('deepseek-v4-flash-vision-exp')).toBe(false)
+    expect(modelLacksVision('deepseek-flash')).toBe(false)
     expect(modelLacksVision('deep-seek-v4-flash-vision-exp-openrouter')).toBe(false)
     expect(modelLacksVision('claude-opus-4-7')).toBe(false)
+  })
+
+  it('matches case-insensitively like its sibling matchers', () => {
+    expect(modelLacksVision('DeepSeek-V4-Pro')).toBe(true)
+    expect(modelLacksVision('DEEPSEEK-V4-FLASH')).toBe(true)
+    expect(modelLacksVision('DeepSeek-V4-Flash-Vision-Exp')).toBe(false)
+  })
+
+  it('holds back the text-only Ling ids but not the VL branch', () => {
+    for (const model of [
+      'Ling-3.0-flash',
+      'Ling-3.0-tiny',
+      'Ling-2.6-1T',
+      'Ring-2.6-1T',
+      'Ling-2.6-flash',
+      'ling-3.0-flash',
+      'LING-2.6-1T',
+    ]) {
+      expect(modelLacksVision(model)).toBe(true)
+    }
+    // the multimodal member reads images, so it must fall through
+    expect(modelLacksVision('Ling-3.0-flash-VL')).toBe(false)
+    expect(modelLacksVision('ling-3.0-flash-vl')).toBe(false)
+  })
+
+  it('flags LongCat-2.0 but not the multimodal 2.5 preview', () => {
+    expect(modelLacksVision('LongCat-2.0')).toBe(true)
+    expect(modelLacksVision('longcat-2.0')).toBe(true)
+    expect(modelLacksVision('LongCat-2.5-Preview')).toBe(false)
+    // the OpenCode Go pool spelling of the same preview tier
+    expect(modelLacksVision('longcat-2.5-preview-free')).toBe(false)
+  })
+
+  it('splits vision per model on the two providers that carry one multimodal id', () => {
+    // the provider flag alone would hand screenshots to the text ids
+    for (const id of ['ling', 'longcat'] as const) {
+      expect(AI_PROVIDER_ADAPTERS[id].capabilities.vision).toBe(true)
+    }
+    expect(AI_PROVIDER_ADAPTERS.spark.capabilities.vision).toBe(false)
   })
 })
 
@@ -293,7 +512,75 @@ describe('modelEchoesReasoning', () => {
     expect(modelEchoesReasoning('minimax-m2p7')).toBe(true)
     expect(modelEchoesReasoning('deep-seek-v4-flash')).toBe(true)
     expect(modelEchoesReasoning('deepseek-v4-pro')).toBe(true)
+    expect(modelEchoesReasoning('deepseek-flash')).toBe(true)
     expect(modelEchoesReasoning('gpt-5.6-luna')).toBe(false)
     expect(modelEchoesReasoning('kimi-k3')).toBe(false)
+  })
+
+  it('flags Hunyuan (hy4-preview thinks by default) without swallowing other ids', () => {
+    expect(modelEchoesReasoning('hy3')).toBe(true)
+    expect(modelEchoesReasoning('hy4-preview')).toBe(true)
+    expect(modelEchoesReasoning('HY3')).toBe(true)
+    // a model id that merely starts with the same letters must not match
+    expect(modelEchoesReasoning('hunyuan-turbo')).toBe(false)
+    expect(modelEchoesReasoning('phy3')).toBe(false)
+    expect(modelEchoesReasoning('mimo-v2.6-pro')).toBe(false)
+  })
+})
+
+describe('modelHasFixedSampling case handling', () => {
+  it('matches fixed-sampling families case-insensitively like modelEchoesReasoning does', () => {
+    expect(modelHasFixedSampling('GPT-5.6-sol')).toBe(true)
+    expect(modelHasFixedSampling('KIMI-K3')).toBe(true)
+    expect(modelHasFixedSampling('Gemini-3.7-flash')).toBe(true)
+    expect(modelHasFixedSampling('O1-mini')).toBe(true)
+    expect(modelHasFixedSampling('gpt-4o-mini')).toBe(false)
+  })
+
+  it('omits temperature for upper-case fixed-sampling ids on mirror routes', () => {
+    expect(
+      AI_PROVIDER_ADAPTERS.custom.resolveEndpoint(config('GPT-5.6-terra', 'https://mirror/v1')),
+    ).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://mirror/v1',
+      omitTemperature: true,
+    })
+    expect(AI_PROVIDER_ADAPTERS.openrouter.resolveEndpoint(config('MOONSHOTAI/KIMI-K3'))).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      omitTemperature: true,
+    })
+  })
+
+  it('carries omitTemperature onto every opencode route, including upper-case mirrors', () => {
+    // minimax rides Messages on Go; it is not fixed-sampling, so no flag
+    expect(AI_PROVIDER_ADAPTERS['opencode-go'].resolveEndpoint(config('minimax-m2'))).toEqual({
+      protocol: 'anthropic',
+      baseUrl: 'https://opencode.ai/zen/go',
+    })
+    // upper-case fixed-sampling ids via the Zen openai-compatible route must omit
+    expect(AI_PROVIDER_ADAPTERS['opencode-zen'].resolveEndpoint(config('GPT-5.6-sol'))).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      omitTemperature: true,
+    })
+    expect(AI_PROVIDER_ADAPTERS['opencode-zen'].resolveEndpoint(config('KIMI-K3'))).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://opencode.ai/zen/v1',
+      omitTemperature: true,
+    })
+    // KIMI prefix check is case-insensitive on opencode routes (all Kimi ids omit there)
+    expect(AI_PROVIDER_ADAPTERS['opencode-go'].resolveEndpoint(config('KIMI-K2.7-code'))).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      omitTemperature: true,
+    })
+    expect(
+      AI_PROVIDER_ADAPTERS.custom.resolveEndpoint(config('KIMI-K3', 'https://mirror/v1')),
+    ).toEqual({
+      protocol: 'openai-compatible',
+      baseUrl: 'https://mirror/v1',
+      omitTemperature: true,
+    })
   })
 })

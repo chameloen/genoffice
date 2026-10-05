@@ -131,7 +131,6 @@ export const ja = {
   appTruncationNote: '先頭 {shown}/{total} 項目',
   // ExcelShell (name box / ribbon)
   appGoToButtonTitle: 'ジャンプ（Go To、⌘G）',
-  appNameBoxTitle: '名前ボックス — アドレスまたは名前を入力して Enter で移動',
   appPivotChartHintIn: '現在のピボットテーブルからピボットグラフを作成',
   appPivotChartHintOut:
     '先にピボットテーブルの出力範囲内のセルを選択してから、グラフの種類を選択してください',
@@ -326,13 +325,13 @@ export const ja = {
   appDialogCancel: 'キャンセル',
   appPivotSheetNoMove:
     'このシートにはピボットテーブルが含まれています — 範囲の移動には未対応です。',
+  appMergeOverTable:
+    '選択範囲が Excel テーブルと重なっています — テーブル内のセル結合は現時点では対応していません。',
   appTableFilterNoEdit:
     'このシートのフィルターは Excel テーブルに属しています — 編集内容は現時点では保存できません。',
   appAutofillStreaming: 'ストリーミング読み込み中の範囲へのオートフィルはまだ許可されていません。',
   appDvNeedsIndexed:
     'データの入力規則を編集するには、このシートのインデックス作成が完了している必要があります — しばらくしてからお試しください。',
-  appDuplicateNeedsFullLoad:
-    'シートのコピーには完全読み込みモードが必要です。このブックは大きすぎるため、ストリーミング読み込みのみ行われました。',
   appPivotSheetNoDuplicate:
     'このシートにはピボットテーブルが含まれています — このシートのコピーには未対応です。',
   appDuplicateScopedNames:
@@ -519,6 +518,7 @@ export const ja = {
   appBridgeUnavailable:
     'デスクトップファイルブリッジが利用できません。Electron アプリを再起動してください。',
   appOpenCanceled: 'ブックの選択をキャンセルしました。',
+  appOpeningWorkbook: 'ブックを開いています…',
   appOpened: '{name} を開きました — セルの編集は ⌘S でファイルに保存されます。',
   appOpenFailed: 'ブックを開けません。',
   appPageSetupNeedsFile: '先に XLSX ファイルを開いてください。ページ設定はファイルに保存されます。',
@@ -555,6 +555,12 @@ export const ja = {
   appPdfCanceled: 'PDF エクスポートをキャンセルしました。',
   appPdfExported: '{path} をエクスポートしました。',
   appPdfExportFailed: 'PDF をエクスポートできません。',
+  appPrintPreparing: '印刷を準備しています…',
+  appPrintSent: 'プリンターに送信しました。',
+  appPrintCanceled: '印刷をキャンセルしました。',
+  appPrintFailed: '印刷できません。',
+  appPrintNeedsFullLoad:
+    '印刷にはワークブックの完全な読み込みが必要です。読み込み完了までお待ちください。',
   appCsvExportNeedsFullLoad:
     'CSV エクスポートにはブックの完全読み込みが必要です — 読み込みの完了をお待ちください。',
   appCsvExportTooLarge: 'シートが大きすぎるため、CSV をエクスポートできません。',
@@ -591,6 +597,8 @@ export const ja = {
     '定義された名前の変更は行/列やシート構造の変更と一緒に保存できません — 2 回に分けて保存してください。',
   appSaveErrChangedOnDisk:
     'ファイルがディスク上で別のプログラムに変更されました — 保存を中止しました。開き直してからやり直してください。',
+  appSaveErrTargetLocked:
+    'ファイルを置き換えられませんでした。別のプログラム（Excel で開いている、同期・ウイルススキャン中など）にロックされているようです。閉じてから再度保存してください。',
   appSaveErrStylesheetLimited:
     'このブックのスタイルシートには基本構造が欠けているため、スタイルの変更を保存できません。',
   appSaveErrPackageGuard:
@@ -648,6 +656,9 @@ export const ja = {
   appFullyLoaded: 'ブックを完全に読み込みました — 数式はライブで再計算され、行列を編集できます。',
   appRangeMustBeVector: '{range} は 1 行または 1 列のセルである必要があります。',
   appRangeTooManyCells: '{range} が {max} 個のセルを超えています。',
+  appCopyLoadingRange: 'コピーのため {range} を読み込んでいます…',
+  appCopyValuesOnly:
+    '{range} を値のみでコピーしました（{cells} セル）：{max} セルを超える範囲では書式は保持されません。',
   appSheetStillIndexing: 'シートのインデックスを作成中です — しばらくしてからお試しください。',
   // Print (export PDF)
   appPrintNothing: 'このシートには印刷できる内容がありません。',
@@ -684,7 +695,7 @@ export const ja = {
   appTabData: 'データ',
   appTabReview: '校閲',
   appRibbonCollapse: 'リボンを折りたたむ',
-  appRibbonPin: 'リボンの固定',
+  appRibbonExpand: 'リボンを展開する',
   appTabView: '表示',
   appTabAi: 'AI',
   appTabChartDesign: 'グラフのデザイン',
@@ -1238,6 +1249,15 @@ export const ja = {
   appResetZoom: 'ズームのリセット',
   appZoomToSelection: '選択範囲に合わせて拡大/縮小',
   appZoomToSelectionDetail: '選択範囲に合わせる',
+  appStatAverage: '平均',
+  appStatCount: 'データの個数',
+  appStatNumericalCount: '数値の個数',
+  appStatMin: '最小値',
+  appStatMax: '最大値',
+  appStatSum: '合計',
+  appZoomLevel: 'ズームレベル',
+  appNormalViewTip: '標準表示',
+  appPageBreakPreviewTip: '改ページプレビュー',
   appGroupWindow: 'ウィンドウ',
   appFreezePanes: 'ウィンドウ枠の固定',
   appFreezeTitle: '行と列を固定',
@@ -1283,6 +1303,9 @@ export const ja = {
   appCutTitle: '切り取り ⌘X',
   appCopyTitle: 'コピー ⌘C',
   appFormatPainter: '書式のコピー/貼り付け',
+  appFormatPainterTip: '書式のコピー/貼り付け — ダブルクリックで Esc まで連続適用',
+  appFormatPainterLocked:
+    '書式のコピーを固定しました — 範囲を選択するたびに適用します。Esc かボタンで終了。',
   appGroupFont: 'フォント',
   appIncreaseFontSize: 'フォントサイズの拡大',
   appDecreaseFontSize: 'フォントサイズの縮小',
@@ -1357,6 +1380,8 @@ export const ja = {
   appFormatMenu: '書式',
   appRowHeight: '行の高さ',
   appColWidth: '列の幅',
+  appAutoFitRowHeight: '行の高さの自動調整',
+  appAutoFitColWidth: '列の幅の自動調整',
   appRowHeightLabel: '行の高さ（ポイント）',
   appColWidthLabel: '列の幅（文字数）',
   appDeleteRow: '行の削除',
@@ -1373,4 +1398,6 @@ export const ja = {
   appFindTitle: '検索と選択 ⌘F',
   appReplace: '置換',
   appGoTo: 'ジャンプ',
+  appInsertCells: 'セルの挿入…',
+  appDeleteCells: 'セルの削除…',
 } satisfies Record<keyof typeof zh, string>

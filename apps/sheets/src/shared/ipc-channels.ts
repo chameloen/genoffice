@@ -53,6 +53,14 @@ export const IPC_CHANNELS = {
   openWorkbooksForMerge: 'workbook:open-for-merge',
   readWorkbookRange: 'workbook:read-range',
   readWorkbookFormulas: 'workbook:read-formulas',
+  /// The sidecar process died; every session id the renderer holds is gone.
+  /// A positive crash signal, so recovery never has to infer a crash from a
+  /// session guard's error text (the Save swap and closeWorkbook reject ids
+  /// with that same text on purpose).
+  sidecarCrashed: 'workbook:sidecar-crashed',
+  /// Re-open an already-known path through the normal open path (the same
+  /// pipeline selectWorkbook runs), for recovering from a sidecar crash.
+  reopenWorkbook: 'workbook:reopen',
   recalcWorkbook: 'workbook:recalc',
   readWorkbookMedia: 'workbook:read-media',
   readPivotDefinition: 'workbook:read-pivot-definition',
@@ -74,6 +82,7 @@ export const IPC_CHANNELS = {
   closeSaveRequest: 'workbook:close-save-request',
   closeSaveResult: 'workbook:close-save-result',
   exportPdf: 'workbook:export-pdf',
+  printWorkbook: 'workbook:print',
   exportCsv: 'workbook:export-csv',
   csvSaveConfirm: 'workbook:csv-save-confirm',
   /** AI create_document: new standalone file in the default folder (no dialog) */
@@ -92,6 +101,11 @@ export const IPC_CHANNELS = {
   aiFetchImage: 'ai:fetch-image',
   // sheets: prefix — slides' ai:generate-image only registers once a slides view exists
   aiGenerateImage: 'sheets:ai-generate-image',
+  // MCP visible-grid bridge: shell pushes one command, the renderer that owns
+  // the Univer workbook executes it with the built-in AI's executors
+  mcpCommand: 'sheets:mcp-command',
+  mcpResult: 'sheets:mcp-result',
+  mcpReady: 'sheets:mcp-ready',
   // Chat attachments (sheets: prefix — docs already registers global files:* in
   // the shell; avoids collisions)
   captureScreenSources: 'sheets:capture-screen-sources',

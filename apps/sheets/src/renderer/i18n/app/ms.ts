@@ -129,7 +129,6 @@ export const ms = {
   appMoreItems: '+{count} lagi…',
   appTruncationNote: '{shown} pertama daripada {total}',
   appGoToButtonTitle: 'Pergi Ke (⌘G)',
-  appNameBoxTitle: 'Kotak Nama — taip alamat atau nama, kemudian tekan Enter',
   appPivotChartHintIn: 'Cipta Carta Pangsi daripada Jadual Pangsi semasa',
   appPivotChartHintOut: 'Pilih sel dalam output Jadual Pangsi dahulu, kemudian pilih jenis carta',
   appChartColumn: 'Lajur',
@@ -312,13 +311,13 @@ export const ms = {
     'Buku kerja ini terlalu besar untuk dimuatkan sepenuhnya ke ingatan; penapisan tidak tersedia untuk fail ini.',
   appDialogCancel: 'Batal',
   appPivotSheetNoMove: 'Helaian ini mengandungi Jadual Pangsi — pengalihan julat belum disokong.',
+  appMergeOverTable:
+    'Pilihan bertindih dengan jadual Excel — mencantumkan sel di dalam jadual belum disokong.',
   appTableFilterNoEdit:
     'Penapis helaian ini milik jadual Excel — pengeditannya belum boleh disimpan.',
   appAutofillStreaming: 'AutoIsi ke kawasan yang masih distrim belum dibenarkan.',
   appDvNeedsIndexed:
     'Mengedit pengesahihan data memerlukan helaian ini diindeks sepenuhnya dahulu — cuba lagi sebentar.',
-  appDuplicateNeedsFullLoad:
-    'Menduplikasi helaian memerlukan mod muat penuh — buku kerja ini terlalu besar dan distrim sebahagian.',
   appPivotSheetNoDuplicate:
     'Helaian ini mengandungi Jadual Pangsi — pendupikasiannya belum disokong.',
   appDuplicateScopedNames:
@@ -489,6 +488,7 @@ export const ms = {
   appColumnLabel: 'Lajur {col}',
   appBridgeUnavailable: 'Jambatan fail desktop tidak tersedia. Mulakan semula aplikasi Electron.',
   appOpenCanceled: 'Pemilihan buku kerja dibatalkan.',
+  appOpeningWorkbook: 'Membuka buku kerja…',
   appOpened: '{name} dibuka — suntingan sel disimpan semula dengan ⌘S.',
   appOpenFailed: 'Tidak dapat membuka buku kerja.',
   appPageSetupNeedsFile: 'Buka fail XLSX dahulu — persediaan halaman disimpan ke dalam fail.',
@@ -524,6 +524,12 @@ export const ms = {
   appPdfCanceled: 'Eksport PDF dibatalkan.',
   appPdfExported: '{path} dieksport.',
   appPdfExportFailed: 'Tidak dapat mengeksport PDF.',
+  appPrintPreparing: 'Menyediakan cetakan…',
+  appPrintSent: 'Dihantar ke pencetak.',
+  appPrintCanceled: 'Cetakan dibatalkan.',
+  appPrintFailed: 'Tidak dapat mencetak.',
+  appPrintNeedsFullLoad:
+    'Cetakan memerlukan buku kerja dimuatkan sepenuhnya — tunggu sehingga pemuatan selesai.',
   appCsvExportNeedsFullLoad:
     'Eksport CSV memerlukan buku kerja dimuatkan sepenuhnya — tunggu pemuatan selesai.',
   appCsvExportTooLarge: 'Helaian terlalu besar untuk dieksport sebagai CSV.',
@@ -560,6 +566,8 @@ export const ms = {
     'Perubahan nama tertakrif tidak boleh disimpan bersama perubahan baris/lajur atau struktur helaian — simpan dalam dua langkah.',
   appSaveErrChangedOnDisk:
     'Fail telah diubah pada cakera oleh program lain — penyimpanan dihentikan; buka semula fail dan cuba lagi.',
+  appSaveErrTargetLocked:
+    'Fail tidak dapat diganti — nampaknya dikunci oleh program lain (dibuka dalam Excel, atau sedang diimbas/disegerak). Tutup di sana dan simpan semula.',
   appSaveErrStylesheetLimited:
     'Helaian gaya buku kerja ini kekurangan struktur asas; perubahan gaya tidak boleh disimpan.',
   appSaveErrPackageGuard:
@@ -615,6 +623,9 @@ export const ms = {
     'Buku kerja dimuatkan sepenuhnya — formula dikira semula secara langsung, baris/lajur boleh diedit.',
   appRangeMustBeVector: '{range} mesti satu baris atau satu lajur sel.',
   appRangeTooManyCells: '{range} merangkumi lebih daripada {max} sel.',
+  appCopyLoadingRange: 'Memuatkan {range} untuk disalin…',
+  appCopyValuesOnly:
+    '{range} disalin sebagai nilai sahaja ({cells} sel): gaya hanya dikekalkan hingga {max} sel.',
   appSheetStillIndexing: 'Helaian masih diindeks — cuba lagi sebentar.',
   appPrintNothing: 'Helaian ini tiada apa untuk dicetak.',
   appPrintTooLarge:
@@ -649,7 +660,7 @@ export const ms = {
   appTabData: 'Data',
   appTabReview: 'Semakan',
   appRibbonCollapse: 'Runtuhkan Reben',
-  appRibbonPin: 'Semat Reben',
+  appRibbonExpand: 'Kembangkan Reben',
   appTabView: 'Pandangan',
   appTabAi: 'AI',
   appTabChartDesign: 'Reka Bentuk Carta',
@@ -1191,6 +1202,15 @@ export const ms = {
   appResetZoom: 'Tetapkan semula zum',
   appZoomToSelection: 'Zum ke Pilihan',
   appZoomToSelectionDetail: 'Muat pada pilihan',
+  appStatAverage: 'Purata',
+  appStatCount: 'Bilangan',
+  appStatNumericalCount: 'Bilangan berangka',
+  appStatMin: 'Minimum',
+  appStatMax: 'Maksimum',
+  appStatSum: 'Jumlah',
+  appZoomLevel: 'Tahap zum',
+  appNormalViewTip: 'Paparan biasa',
+  appPageBreakPreviewTip: 'Pratonton pemisah halaman',
   appGroupWindow: 'Tetingkap',
   appFreezePanes: 'Bekukan Anak Tetingkap',
   appFreezeTitle: 'Bekukan baris dan lajur',
@@ -1234,6 +1254,9 @@ export const ms = {
   appCutTitle: 'Potong ⌘X',
   appCopyTitle: 'Salin ⌘C',
   appFormatPainter: 'Pelukis Format',
+  appFormatPainterTip: 'Pelukis Format — klik dua kali untuk kekal aktif sehingga Esc',
+  appFormatPainterLocked:
+    'Pelukis Format dikunci — pilih julat untuk digunakan; Esc atau klik butang untuk berhenti.',
   appGroupFont: 'Fon',
   appIncreaseFontSize: 'Besarkan saiz fon',
   appDecreaseFontSize: 'Kecilkan saiz fon',
@@ -1309,6 +1332,8 @@ export const ms = {
   appFormatMenu: 'Format',
   appRowHeight: 'Tinggi baris',
   appColWidth: 'Lebar lajur',
+  appAutoFitRowHeight: 'Autosuai Ketinggian Baris',
+  appAutoFitColWidth: 'Autosuai Kelebaran Lajur',
   appRowHeightLabel: 'Tinggi baris (mata)',
   appColWidthLabel: 'Lebar lajur (aksara)',
   appDeleteRow: 'Padam baris',
@@ -1325,4 +1350,6 @@ export const ms = {
   appFindTitle: 'Cari & Pilih ⌘F',
   appReplace: 'Ganti',
   appGoTo: 'Pergi Ke',
+  appInsertCells: 'Sisip Sel…',
+  appDeleteCells: 'Padam Sel…',
 } satisfies Record<keyof typeof zh, string>

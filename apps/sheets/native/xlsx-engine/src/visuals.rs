@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 use base64::Engine;
 use roxmltree::{Document, Node};
@@ -9,10 +9,12 @@ use serde::Serialize;
 use zip::ZipArchive;
 
 use crate::SidecarError;
+use crate::xml_util::copy_entry_bounded;
 
 mod charts;
 mod colors;
 mod drawing;
+mod source_formats;
 mod styles;
 #[cfg(test)]
 mod tests;
@@ -20,6 +22,9 @@ mod tests;
 pub(crate) use charts::*;
 pub(crate) use colors::*;
 pub(crate) use drawing::*;
+pub use source_formats::SourceFormats;
+#[cfg(test)]
+pub(crate) use source_formats::{reset_sheet_passes, sheet_passes};
 pub(crate) use styles::*;
 
 const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
@@ -202,6 +207,27 @@ pub struct ChartSeries {
     /// draws each series with its own group's type instead of by position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plot: Option<String>,
+    /// Label mode this series resolves to: its own `c:dLbls`, else the plot
+    /// element's. Absent when neither carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_labels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_labels: Option<Vec<PointLabel>>,
+}
+
+/// Per-point `c:dLbl`: whether the value shows, plus the manualLayout
+/// offset from the default anchor as fractions of the chart space.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointLabel {
+    pub index: u32,
+    /// Absent when the dLbl carries no showVal/delete: the series mode applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_val: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_y: Option<f64>,
 }
 
 /// One outer-level group label spanning innermost categories [start, end).
@@ -236,6 +262,21 @@ pub struct ShapeParagraph {
     /// a:pPr/@algn — l | ctr | r | just; absent means left.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub align: Option<String>,
+    /// a:pPr/@marL in points — left edge of wrapped lines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_left: Option<f64>,
+    /// a:pPr/@indent in points — first-line offset from marL (negative hangs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indent: Option<f64>,
+    /// a:buAutoNum/@type (ST_TextAutonumberScheme); the bullet is a running number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullet_scheme: Option<String>,
+    /// a:buAutoNum/@startAt (default 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullet_start_at: Option<u32>,
+    /// a:buChar/@char — a literal bullet glyph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bullet_char: Option<String>,
     pub runs: Vec<ShapeRun>,
 }
 
@@ -254,6 +295,9 @@ pub struct ShapeRun {
     /// Points (a:rPr/@sz / 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<f64>,
+    /// a:rPr/@cap — all | small; the stored text keeps its own casing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caps: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -290,6 +334,26 @@ pub struct AxisInfo {
     pub hidden: bool,
     /// c:scaling/c:orientation val="maxMin" — categories/values run reversed.
     pub reversed: bool,
+    /// c:axPos side (l/r/t/b) the axis is drawn on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// Tick label font size in points (c:txPr//a:defRPr/@sz / 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_color: Option<String>,
+    /// Axis title font size in points and color.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_color: Option<String>,
+    /// c:dispUnits divisor (builtInUnit or custUnit): tick values are shown
+    /// divided by it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_unit: Option<f64>,
+    /// c:dispUnitsLbl text ("Millions"), only when the label element exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_unit_label: Option<String>,
 }
 
 /// Chart-title font shorthand from c:title/c:txPr//a:defRPr.
@@ -370,6 +434,15 @@ pub struct ChartMetadata {
     pub disp_blanks_as: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title_style: Option<ChartTitleStyle>,
+    /// c:chartSpace/c:spPr fill behind the whole chart (flat color).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chart_area_fill: Option<String>,
+    /// c:plotArea/c:spPr fill behind the plot rectangle (flat color).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plot_area_fill: Option<String>,
+    /// c:dLbls/c:txPr//a:defRPr shorthand (Numbers' white inside labels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_label_style: Option<ChartTitleStyle>,
     pub series: Vec<ChartSeries>,
 }
 
@@ -440,6 +513,11 @@ pub struct VisualObject {
     /// a:bodyPr/@anchor — t | ctr | b.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_anchor: Option<String>,
+    /// a:bodyPr/@vertOverflow, @horzOverflow — overflow (default) | clip | ellipsis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_vert_overflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_horz_overflow: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paragraphs: Option<Vec<ShapeParagraph>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -701,11 +779,44 @@ fn collect_mc_children<'a, 'input>(
     }
 }
 
+/// `xl/charts/chartN.xml` and its case/separator variants, without matching
+/// `xl/chartsheets/…` or the `xl/charts/styleN.xml` chart-format parts.
+fn is_chart_part(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase().replace('\\', "/");
+    let Some(rest) = lowered.strip_prefix("xl/") else {
+        return false;
+    };
+    let Some(file) = rest.strip_prefix("charts/chart") else {
+        return false;
+    };
+    let Some(stem) = file.strip_suffix(".xml") else {
+        return false;
+    };
+    !stem.is_empty() && !stem.contains('/')
+}
+
 pub fn read_visual_objects(
     archive: &mut ZipArchive<File>,
     sheets: &[SheetVisualSource],
     colors: &ColorContext,
+    formats: &mut SourceFormats,
 ) -> Result<Vec<VisualObject>, SidecarError> {
+    // Warm the source-format cache for every chart reference first: the
+    // per-lookup fallback reopens a sheet part and streams it from byte zero,
+    // so a workbook with many source-linked series would rescan the same large
+    // worksheet dozens of times during the walk below.
+    let chart_paths: Vec<String> = archive
+        .file_names()
+        .filter(|name| is_chart_part(name))
+        .map(ToOwned::to_owned)
+        .collect();
+    if !chart_paths.is_empty() {
+        let references: Vec<String> = chart_paths
+            .iter()
+            .flat_map(|path| charts::chart_formula_references(archive, path))
+            .collect();
+        formats.prefetch(archive, &references);
+    }
     let mut visuals = Vec::new();
     // Workbook-wide serial for `ole-N` ids: the list position is not usable
     // because an OLE visual may take a fallback shape's slot mid-list.
@@ -714,6 +825,8 @@ pub fn read_visual_objects(
         let sheet_relationships = read_relationships(archive, &sheet.worksheet_path)?;
         let ole_objects = read_ole_objects(archive, &sheet.worksheet_path, &sheet_relationships)?;
         let ole_shape_ids: HashSet<u32> = ole_objects.iter().map(|ole| ole.shape_id).collect();
+        let slicer_captions =
+            read_slicer_captions(archive, &sheet.worksheet_path, &sheet_relationships);
         let drawing_relationship = sheet_relationships
             .values()
             .find(|relationship| relationship.relationship_type.ends_with("/drawing"));
@@ -733,6 +846,8 @@ pub fn read_visual_objects(
                 visuals.len(),
                 colors,
                 &ole_shape_ids,
+                &slicer_captions,
+                formats,
             )?);
         }
         if ole_objects.is_empty() {
@@ -797,6 +912,8 @@ pub fn read_visual_objects(
                 flip_v: false,
                 text_color: None,
                 text_anchor: None,
+                text_vert_overflow: None,
+                text_horz_overflow: None,
                 paragraphs: None,
                 text: None,
                 prog_id: Some(ole.prog_id),
@@ -822,6 +939,40 @@ pub fn read_visual_objects(
         visuals.retain(|visual| !is_fallback(visual));
     }
     Ok(visuals)
+}
+
+/// Slicer/timeline part name → caption for the sheet's `xl/slicers/*.xml`
+/// and `xl/timelines/*.xml` parts; the drawing frame carries only the name.
+fn read_slicer_captions(
+    archive: &mut ZipArchive<File>,
+    worksheet_path: &str,
+    relationships: &HashMap<String, Relationship>,
+) -> HashMap<String, String> {
+    let mut captions = HashMap::new();
+    for relationship in relationships.values().filter(|relationship| {
+        relationship.relationship_type.ends_with("/slicer")
+            || relationship.relationship_type.ends_with("/timeline")
+    }) {
+        let Ok(path) = resolve_part_target(worksheet_path, &relationship.target) else {
+            continue;
+        };
+        let Ok(xml) = read_xml(archive, &path) else {
+            continue;
+        };
+        let Ok(document) = parse_document(&xml, &path) else {
+            continue;
+        };
+        for node in document
+            .descendants()
+            .filter(|node| node.has_tag_name("slicer") || node.has_tag_name("timeline"))
+        {
+            if let (Some(name), Some(caption)) = (node.attribute("name"), node.attribute("caption"))
+            {
+                captions.insert(name.to_owned(), caption.to_owned());
+            }
+        }
+    }
+    captions
 }
 
 /// One worksheet `<oleObject>`: Excel's embedded (or linked) object record.
@@ -1095,15 +1246,18 @@ pub fn read_media(
     media_path: &str,
 ) -> Result<MediaResult, SidecarError> {
     let mut entry = crate::zip_entry(archive, media_path)?;
-    if entry.size() > MAX_MEDIA_BYTES {
+    let declared = entry.size();
+    if declared > MAX_MEDIA_BYTES {
         return Err(SidecarError::Workbook(
             "Embedded image exceeds the media response limit.".into(),
         ));
     }
     let media_type = media_type_for_path(media_path)
         .ok_or_else(|| SidecarError::Workbook("Unsupported embedded image type.".into()))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(declared as usize);
+    // The cap above reads only the declaration; the copy is what keeps a part
+    // that under-declares from delivering its whole payload.
+    copy_entry_bounded(&mut entry, declared, MAX_MEDIA_BYTES, &mut bytes)?;
     Ok(MediaResult {
         media_type: media_type.to_owned(),
         base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -1516,37 +1670,7 @@ pub(crate) fn read_relationships(
 }
 
 pub(crate) fn resolve_part_target(source_path: &str, target: &str) -> Result<String, SidecarError> {
-    let candidate = if target.starts_with('/') {
-        PathBuf::from(target.trim_start_matches('/'))
-    } else {
-        Path::new(source_path)
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(target)
-    };
-    let mut normalized = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(SidecarError::Workbook(
-                        "OOXML relationship escapes the package.".into(),
-                    ));
-                }
-            }
-            Component::CurDir => {}
-            _ => {
-                return Err(SidecarError::Workbook(
-                    "OOXML relationship has an unsafe path.".into(),
-                ));
-            }
-        }
-    }
-    normalized
-        .to_str()
-        .map(|value| value.replace('\\', "/"))
-        .ok_or_else(|| SidecarError::Workbook("OOXML part path is invalid UTF-8.".into()))
+    crate::archive::resolve_relationship_target(source_path, target)
 }
 
 fn read_xml(archive: &mut ZipArchive<File>, path: &str) -> Result<String, SidecarError> {

@@ -4,7 +4,7 @@
  * pageMargins / printOptions / headerFooter plus the workbook-level
  * _xlnm.Print_Area / _xlnm.Print_Titles defined names).
  */
-import { columnLabel, parseRange } from '../domain/cell-address'
+import { columnLabel, parseRange } from '@genoffice/xlsx-gateway/domain/cell-address'
 import type { WorkbookPagePrintSettings } from '../shared/desktop-api'
 import type { HeaderFooterParts, PageSetupJournalState, StructuralJournalOp } from './edit-journal'
 import { fileRangeToScreenRange, fileToScreen } from './view-transform'
@@ -236,20 +236,26 @@ function plainReference(part: string): string {
     .trim()
 }
 
-/// `'S 1'!$A$1:$K$84,'S 1'!$M$1:$N$9` → ['A1:K84', 'M1:N9']. Anything the
-/// print layout cannot crop to (full-column spans, 3-D refs, #REF!) yields
-/// [] so the export falls back to the used range instead of dropping content.
+/// `'S 1'!$A$1:$K$84,'S 1'!$M$1:$N$9` → ['A1:K84', 'M1:N9']. Stale `#REF!`
+/// parts are skipped (Excel prints the rest); a part the print layout cannot
+/// crop to (full-column spans, 3-D refs) yields [] so the export falls back
+/// to the used range instead of dropping the columns Excel would print.
 export function printAreasFromFormula(formula: string | undefined): string[] {
   if (formula === undefined || formula === '') return []
   const areas: string[] = []
   for (const part of splitAreas(formula)) {
+    if (/#REF!/i.test(part)) continue
     const reference = plainReference(part).toUpperCase()
     if (/^[A-Z]{1,3}[0-9]{1,7}$/.test(reference)) {
       areas.push(`${reference}:${reference}`)
       continue
     }
     if (/^[A-Z]{1,3}[0-9]{1,7}:[A-Z]{1,3}[0-9]{1,7}$/.test(reference)) {
-      areas.push(reference)
+      // Some writers store the corners reversed ($B$4:$A$1). The print layout
+      // reads an area positionally, so an inverted pair would make the span
+      // negative and abort the whole export; parseRange normalises it, and
+      // the rest of the app already relies on that.
+      areas.push(normaliseArea(reference))
       continue
     }
     return []
@@ -271,10 +277,41 @@ export function printTitleRowsFromFormula(formula: string | undefined): string |
   return null
 }
 
+/// Print-title rows repeat atop every page: the layout caps the span at 21 rows.
+export const MAX_PRINT_TITLE_ROWS = 21
+
+/**
+ * Clamp a 1-based title-row span to the layout cap, anchoring at the start
+ * so a tall selection still repeats its top rows instead of being dropped
+ * downstream as an over-cap span.
+ */
+export function clampTitleRows(start: number, end: number): string {
+  const safeStart = Number.isFinite(start) ? Math.max(1, Math.floor(start)) : 1
+  const safeEnd = Number.isFinite(end) ? Math.floor(end) : safeStart
+  return `${safeStart}:${Math.min(Math.max(safeEnd, safeStart), safeStart + MAX_PRINT_TITLE_ROWS - 1)}`
+}
+
+/// Swaps reversed corners back into top-left → bottom-right order, so
+/// `$B$4:$A$1` prints A1:B4 exactly like parseRange treats it.
+function normaliseArea(reference: string): string {
+  const bounds = parseRange(reference)
+  return (
+    `${columnLabel(bounds.startColumn)}${bounds.startRow + 1}:` +
+    `${columnLabel(bounds.endColumn)}${bounds.endRow + 1}`
+  )
+}
+
+/// Excel's formatting toggles (&B bold, &I italic, &U underline, &S strike)
+/// and codes the layout cannot render (&E elapsed, &X/&Y, &Z path): they
+/// carry no text of their own, so they are dropped. Any other &X is literal
+/// user text and must survive.
+const STRIPPED_CODES = new Set(['B', 'I', 'U', 'S', 'E', 'X', 'Y', 'Z'])
+
 /// Excel's encoded header/footer → left/center/right parts. Field codes the
 /// layout resolves (&P &N &D &T &F &A &G picture, && literal) stay verbatim;
-/// formatting codes (font/size/color/bold/…) and unsupported codes (&Z
-/// path) are stripped. Text before the first section marker is centered.
+/// formatting codes (font/size/color/bold/…) and unsupported codes (&Z path)
+/// are stripped, while an unrecognised &X is kept as the literal text Excel
+/// prints. Text before the first section marker is centered.
 export function decodeHeaderFooter(encoded: string): HeaderFooterParts | null {
   const sections = { L: '', C: '', R: '' }
   let current: 'L' | 'C' | 'R' = 'C'
@@ -326,7 +363,16 @@ export function decodeHeaderFooter(encoded: string): HeaderFooterParts | null {
       code === 'G'
     ) {
       sections[current] += `&${code}`
+      index += 2
+      continue
     }
+    // An unrecognised &X is literal user text, not a code: keeping the
+    // character (and any space after the &) is what Excel prints.
+    if (STRIPPED_CODES.has(code)) {
+      index += 2
+      continue
+    }
+    sections[current] += `&${code}`
     index += 2
   }
   if (sections.L === '' && sections.C === '' && sections.R === '') return null

@@ -2,7 +2,8 @@
 // anchor metadata and page-position resolution, group transforms.
 import { attrsOf, childrenOf, findChild, nameOf, type XNode } from './xml-utils'
 import { EMU_PER_PX } from './parse-xml-text'
-import type { SectionSettings, TextboxDisplay, ThemeColors } from './types'
+import { DEFAULT_THEME_COLORS } from './theme'
+import type { SectionSettings, TextGlow, TextOutline, TextboxDisplay, ThemeColors } from './types'
 
 /**
  * Display-only extraction of anchored textboxes: DrawingML (wps:wsp, converter
@@ -148,9 +149,7 @@ function gradStopRgb(gs: XNode, theme?: ThemeColors | null): number[] | null {
   if (!base && scheme) {
     const slot = SCHEME_CLR_SLOTS[attrsOf(scheme)['val'] ?? '']
     if (!slot) return null
-    base =
-      (theme?.[slot] as string | undefined) ??
-      (slot === 'dk1' ? '000000' : slot === 'lt1' ? 'FFFFFF' : undefined)
+    base = (theme?.[slot] as string | undefined) ?? DEFAULT_THEME_COLORS[slot]
   }
   if (!base || !/^[0-9A-Fa-f]{6}$/.test(base)) return null
   let rgb = [0, 2, 4].map((i) => parseInt(base!.slice(i, i + 2), 16))
@@ -279,13 +278,16 @@ export function drawingAnchorMeta(frag: string): DrawingAnchorMeta {
   meta.offsetXEmu = posOf('H')
   meta.offsetYEmu = posOf('V')
   for (const side of ['L', 'R'] as const) {
-    const v = parseInt(new RegExp(`\\bdist${side}="(\\d+)"`).exec(anchorTag)?.[1] ?? '', 10)
+    const v = parseInt(
+      new RegExp(`\\bdist${side}\\s*=\\s*["'](\\d+)["']`).exec(anchorTag)?.[1] ?? '',
+      10,
+    )
     if (Number.isFinite(v)) meta[`dist${side}Emu`] = v
   }
   for (const dir of ['H', 'V'] as const) {
     const m = new RegExp(`<wp:position${dir}\\b([^>]*)>([\\s\\S]*?)</wp:position${dir}>`).exec(frag)
     if (!m) continue
-    const rel = /relativeFrom="(\w+)"/.exec(m[1])?.[1]
+    const rel = /relativeFrom\s*=\s*["'](\w+)["']/.exec(m[1])?.[1]
     const align = /<wp:align>(\w+)<\/wp:align>/.exec(m[2])?.[1]
     const pct = parseInt(
       new RegExp(`<wp14:pctPos${dir}Offset[^>]*>(-?\\d+)<`).exec(m[2])?.[1] ?? '',
@@ -301,21 +303,21 @@ export function drawingAnchorMeta(frag: string): DrawingAnchorMeta {
       if (Number.isFinite(pct)) meta.pctV = pct
     }
   }
-  const extent = /<wp:extent[^>]*cx="(\d+)"[^>]*cy="(\d+)"/.exec(frag)
-  if (extent) {
-    meta.extentXEmu = parseInt(extent[1], 10)
-    meta.extentYEmu = parseInt(extent[2], 10)
-  }
+  const extentTag = /<wp:extent[^>]*\/?>/.exec(frag)?.[0] ?? ''
+  const extentX = parseInt(/\bcx\s*=\s*["'](\d+)["']/.exec(extentTag)?.[1] ?? '', 10)
+  const extentY = parseInt(/\bcy\s*=\s*["'](\d+)["']/.exec(extentTag)?.[1] ?? '', 10)
+  if (Number.isFinite(extentX)) meta.extentXEmu = extentX
+  if (Number.isFinite(extentY)) meta.extentYEmu = extentY
   // the anchor's own wrap element sits before a:graphic; a nested drawing's
   // wrap must not leak up. behindDoc is z-order only: a behind-text picture
   // with wrapTight/wrapSquare/wrapTopAndBottom still excludes the text
   const graphicAt = frag.indexOf('<a:graphic')
   const ownXml = graphicAt === -1 ? frag : frag.slice(0, graphicAt)
-  const behind = /behindDoc="(?:1|true)"/.test(anchorTag)
+  const behind = /behindDoc\s*=\s*["'](?:1|true)["']/.test(anchorTag)
   const ownWrapped = /<wp:wrap(?:Square|Tight|Through|TopAndBottom)\b/.test(ownXml)
   if (frag.includes('<wp:wrapNone') || (behind && !ownWrapped)) meta.noWrap = true
   if (behind) meta.behind = true
-  const relHeight = Number(/relativeHeight="(\d+)"/.exec(anchorTag)?.[1] ?? NaN)
+  const relHeight = Number(/relativeHeight\s*=\s*["'](\d+)["']/.exec(anchorTag)?.[1] ?? NaN)
   if (Number.isFinite(relHeight) && relHeight - 251658240 !== 0) meta.z = relHeight - 251658240
   if (ownXml.includes('<wp:wrapTopAndBottom')) meta.topBottom = true
   return meta
@@ -442,9 +444,7 @@ function w14ColorRgb(node: XNode, theme?: ThemeColors | null): number[] | null {
   if (isScheme) {
     const slot = SCHEME_CLR_SLOTS[base ?? '']
     if (!slot) return null
-    base =
-      (theme?.[slot] as string | undefined) ??
-      (slot === 'dk1' ? '000000' : slot === 'lt1' ? 'FFFFFF' : undefined)
+    base = (theme?.[slot] as string | undefined) ?? DEFAULT_THEME_COLORS[slot]
   }
   if (!base || !/^[0-9A-Fa-f]{6}$/.test(base)) return null
   let rgb = [0, 2, 4].map((i) => parseInt(base!.slice(i, i + 2), 16))
@@ -514,6 +514,49 @@ export function w14TextFillHex(rPr: XNode, theme?: ThemeColors | null): string |
     .filter((rgb): rgb is number[] => rgb !== null)
   if (stops.length === 0) return undefined
   return rgbHex([0, 1, 2].map((i) => stops.reduce((sum, rgb) => sum + rgb[i], 0) / stops.length))
+}
+
+/** w14:textOutline stroke (solid fills only; gradient/noFill outlines are not drawn) */
+export function w14TextOutlineOf(rPr: XNode, theme?: ThemeColors | null): TextOutline | undefined {
+  const outline = findChild(rPr, 'w14:textOutline')
+  if (!outline) return undefined
+  const solid = findChild(outline, 'w14:solidFill')
+  if (!solid) return undefined
+  const rgb = w14ColorRgb(solid, theme)
+  if (!rgb) return undefined
+  const widthEmu = parseInt(attrsOf(outline)['w14:w'] ?? '', 10)
+  if (!(widthEmu > 0)) return undefined
+  const colorNode = findChild(solid, 'w14:srgbClr') ?? findChild(solid, 'w14:schemeClr')
+  const alphaRaw = parseInt(
+    attrsOf(findChild(colorNode ?? {}, 'w14:alpha') ?? {})['w14:val'] ?? '',
+    10,
+  )
+  const alpha = alphaRaw >= 0 && alphaRaw < 100000 ? alphaRaw / 100000 : undefined
+  return {
+    color: rgbHex(rgb),
+    widthPt: Math.round((widthEmu / 12700) * 100) / 100,
+    ...(alpha !== undefined ? { alpha } : {}),
+  }
+}
+
+/** w14:glow halo (radius in EMU, color with optional alpha) */
+export function w14GlowOf(rPr: XNode, theme?: ThemeColors | null): TextGlow | undefined {
+  const glow = findChild(rPr, 'w14:glow')
+  if (!glow) return undefined
+  const rgb = w14ColorRgb(glow, theme)
+  const radEmu = parseInt(attrsOf(glow)['w14:rad'] ?? '', 10)
+  if (!rgb || !(radEmu > 0)) return undefined
+  const colorNode = findChild(glow, 'w14:srgbClr') ?? findChild(glow, 'w14:schemeClr')
+  const alphaRaw = parseInt(
+    attrsOf(findChild(colorNode ?? {}, 'w14:alpha') ?? {})['w14:val'] ?? '',
+    10,
+  )
+  const alpha = alphaRaw >= 0 && alphaRaw < 100000 ? alphaRaw / 100000 : undefined
+  return {
+    color: rgbHex(rgb),
+    radiusPt: Math.round((radEmu / 12700) * 100) / 100,
+    ...(alpha !== undefined ? { alpha } : {}),
+  }
 }
 
 export interface ExtractTextboxOpts {
